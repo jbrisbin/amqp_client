@@ -5,7 +5,6 @@ This is a fork of the [official RabbitMQ/AMQP Erlang client](https://github.com/
 It's meant to be included in your rebar projects in your rebar.config file:
 
 		{deps, [
-			{rabbit_common, ".*", {git, "git://github.com/jbrisbin/rabbit_common.git", "HEAD"}},
 			{amqp_client, ".*", {git, "git://github.com/jbrisbin/amqp_client.git", "HEAD"}}
 		]}.
 
