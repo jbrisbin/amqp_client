@@ -63,7 +63,7 @@ handle_message(socket_closing_timeout,
     {stop, {socket_closing_timeout, Reason}, State};
 handle_message(socket_closed, State = #state{waiting_socket_close = true,
                                              closing_reason = Reason}) ->
-    {stop, Reason, State};
+    {stop, {shutdown, Reason}, State};
 handle_message(socket_closed, State = #state{waiting_socket_close = false}) ->
     {stop, socket_closed_unexpectedly, State};
 handle_message({socket_error, _} = SocketError, State) ->
@@ -98,17 +98,19 @@ info_keys() ->
 %% Handshake
 %%---------------------------------------------------------------------------
 
-connect(AmqpParams = #amqp_params{ssl_options = none,
-                                  host        = Host,
-                                  port        = Port}, SIF, ChMgr, State) ->
+connect(AmqpParams = #amqp_params_network{ssl_options = none,
+                                          host        = Host,
+                                          port        = Port},
+        SIF, ChMgr, State) ->
     case gen_tcp:connect(Host, Port, ?RABBIT_TCP_OPTS) of
         {ok, Sock}     -> try_handshake(AmqpParams, SIF, ChMgr,
                                         State#state{sock = Sock});
         {error, _} = E -> E
     end;
-connect(AmqpParams = #amqp_params{ssl_options = SslOpts,
-                                  host        = Host,
-                                  port        = Port}, SIF, ChMgr, State) ->
+connect(AmqpParams = #amqp_params_network{ssl_options = SslOpts,
+                                          host        = Host,
+                                          port        = Port},
+        SIF, ChMgr, State) ->
     rabbit_misc:start_applications([crypto, public_key, ssl]),
     case gen_tcp:connect(Host, Port, ?RABBIT_TCP_OPTS) of
         {ok, Sock} ->
@@ -127,7 +129,7 @@ connect(AmqpParams = #amqp_params{ssl_options = SslOpts,
 try_handshake(AmqpParams, SIF, ChMgr, State) ->
     try handshake(AmqpParams, SIF, ChMgr, State) of
         Return -> Return
-    catch _:Reason -> {error, Reason}
+    catch exit:Reason -> {error, Reason}
     end.
 
 handshake(AmqpParams, SIF, ChMgr, State0 = #state{sock = Sock}) ->
@@ -139,7 +141,8 @@ start_infrastructure(SIF, ChMgr, State = #state{sock = Sock}) ->
     {ok, {_MainReader, _AState, Writer, SHF}} = SIF(Sock, ChMgr),
     {SHF, State#state{writer0 = Writer}}.
 
-network_handshake(AmqpParams, SHF, State0) ->
+network_handshake(AmqpParams = #amqp_params_network{virtual_host = VHost},
+                  SHF, State0) ->
     Start = #'connection.start'{server_properties = ServerProperties,
                                 mechanisms = Mechanisms} =
         handshake_recv('connection.start'),
@@ -147,8 +150,7 @@ network_handshake(AmqpParams, SHF, State0) ->
     Tune = login(AmqpParams, Mechanisms, State0),
     {TuneOk, ChannelMax, State1} = tune(Tune, AmqpParams, SHF, State0),
     do2(TuneOk, State1),
-    do2(#'connection.open'{virtual_host = AmqpParams#amqp_params.virtual_host},
-        State1),
+    do2(#'connection.open'{virtual_host = VHost}, State1),
     Params = {ServerProperties, ChannelMax, State1},
     case handshake_recv('connection.open_ok') of
         #'connection.open_ok'{}                     -> {ok, Params};
@@ -169,9 +171,9 @@ check_version(#'connection.start'{version_major = Major,
 tune(#'connection.tune'{channel_max = ServerChannelMax,
                         frame_max   = ServerFrameMax,
                         heartbeat   = ServerHeartbeat},
-     #amqp_params{channel_max = ClientChannelMax,
-                  frame_max   = ClientFrameMax,
-                  heartbeat   = ClientHeartbeat}, SHF, State) ->
+     #amqp_params_network{channel_max = ClientChannelMax,
+                          frame_max   = ClientFrameMax,
+                          heartbeat   = ClientHeartbeat}, SHF, State) ->
     [ChannelMax, Heartbeat, FrameMax] =
         lists:zipwith(fun (Client, Server) when Client =:= 0; Server =:= 0 ->
                               lists:max([Client, Server]);
@@ -192,8 +194,8 @@ start_heartbeat(SHF, #state{sock = Sock, heartbeat = Heartbeat}) ->
     ReceiveFun = fun () -> Connection ! heartbeat_timeout end,
     SHF(Sock, Heartbeat, SendFun, Heartbeat, ReceiveFun).
 
-login(Params = #amqp_params{auth_mechanisms = ClientMechanisms,
-                            client_properties = UserProps},
+login(Params = #amqp_params_network{auth_mechanisms = ClientMechanisms,
+                                    client_properties = UserProps},
       ServerMechanismsStr, State) ->
     ServerMechanisms = string:tokens(binary_to_list(ServerMechanismsStr), " "),
     case [{N, S, F} || F <- ClientMechanisms,
@@ -250,7 +252,7 @@ handshake_recv(Expecting) ->
                      {error, {unexpected_method, Method,
                               {expecting, Expecting}}}};
                 _ ->
-                    exit({unexpected_method, Method,
+                    throw({unexpected_method, Method,
                           {expecting, Expecting}})
             end;
         socket_closed ->
@@ -265,7 +267,7 @@ handshake_recv(Expecting) ->
         heartbeat_timeout ->
             exit(heartbeat_timeout);
         Other ->
-            exit({handshake_recv_unexpected_message, Other})
+            throw({handshake_recv_unexpected_message, Other})
     after ?HANDSHAKE_RECEIVE_TIMEOUT ->
         case Expecting of
             'connection.open_ok' ->

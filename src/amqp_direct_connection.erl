@@ -27,11 +27,17 @@
 -record(state, {node,
                 user,
                 vhost,
+                params,
+                adapter_info,
                 collector,
                 closing_reason %% undefined | Reason
                }).
 
 -define(INFO_KEYS, [type]).
+
+-define(CREATION_EVENT_KEYS, [pid, protocol, address, port, name,
+                              peer_address, peer_port,
+                              user, vhost, client_properties, type]).
 
 %%---------------------------------------------------------------------------
 
@@ -56,31 +62,72 @@ closing(_ChannelCloseType, Reason, State) ->
 channels_terminated(State = #state{closing_reason = Reason,
                                    collector = Collector}) ->
     rabbit_queue_collector:delete_all(Collector),
-    {stop, Reason, State}.
+    {stop, {shutdown, Reason}, State}.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, #state{node = Node}) ->
+    rpc:call(Node, rabbit_direct, disconnect, [[{pid, self()}]]),
     ok.
 
 i(type, _State) -> direct;
+i(pid,  _State) -> self();
+%% AMQP Params
+i(user,              #state{params = P}) -> P#amqp_params_direct.username;
+i(vhost,             #state{params = P}) -> P#amqp_params_direct.virtual_host;
+i(client_properties, #state{params = P}) ->
+    P#amqp_params_direct.client_properties;
+%% Optional adapter info
+i(protocol,     #state{adapter_info = I}) -> I#adapter_info.protocol;
+i(address,      #state{adapter_info = I}) -> I#adapter_info.address;
+i(port,         #state{adapter_info = I}) -> I#adapter_info.port;
+i(peer_address, #state{adapter_info = I}) -> I#adapter_info.peer_address;
+i(peer_port,    #state{adapter_info = I}) -> I#adapter_info.peer_port;
+i(name,         #state{adapter_info = I}) -> I#adapter_info.name;
+
 i(Item, _State) -> throw({bad_argument, Item}).
 
 info_keys() ->
     ?INFO_KEYS.
 
-connect(#amqp_params{username = Username,
-                     password = Pass,
-                     node = Node,
-                     virtual_host = VHost}, SIF, _ChMgr, State) ->
+infos(Items, State) ->
+    [{Item, i(Item, State)} || Item <- Items].
+
+additional_info(#state{adapter_info = I}) -> I#adapter_info.additional_info.
+
+connect(Params = #amqp_params_direct{username     = Username,
+                                     node         = Node,
+                                     adapter_info = Info,
+                                     virtual_host = VHost},
+        SIF, _ChMgr, State) ->
+    State1 = State#state{node         = Node,
+                         vhost        = VHost,
+                         params       = Params,
+                         adapter_info = ensure_adapter_info(Info)},
     case rpc:call(Node, rabbit_direct, connect,
-                  [Username, Pass, VHost, ?PROTOCOL]) of
+                  [Username, VHost, ?PROTOCOL,
+                   infos(?CREATION_EVENT_KEYS, State1) ++
+                       additional_info(State1)]) of
         {ok, {User, ServerProperties}} ->
             {ok, Collector} = SIF(),
-            {ok, {ServerProperties, 0, State#state{node = Node,
-                                                   user = User,
-                                                   vhost = VHost,
-                                                   collector = Collector}}};
+            State2 = State1#state{user      = User,
+                                  collector = Collector},
+            {ok, {ServerProperties, 0, State2}};
         {error, _} = E ->
             E;
         {badrpc, nodedown} ->
             {error, {nodedown, Node}}
     end.
+
+ensure_adapter_info(none) ->
+    ensure_adapter_info(#adapter_info{});
+
+ensure_adapter_info(A = #adapter_info{protocol = unknown}) ->
+    ensure_adapter_info(A#adapter_info{protocol =
+                                           {'Direct', ?PROTOCOL:version()}});
+
+ensure_adapter_info(A = #adapter_info{name         = unknown,
+                                      peer_address = unknown,
+                                      peer_port    = unknown}) ->
+    Name = list_to_binary(rabbit_misc:pid_to_string(self())),
+    ensure_adapter_info(A#adapter_info{name = Name});
+
+ensure_adapter_info(Info) -> Info.
