@@ -55,9 +55,6 @@ do2(Method, #state{writer0 = Writer}) ->
     %% Catching because it expects the {channel_exit, _} message on error
     catch rabbit_writer:send_command_sync(Writer, Method).
 
-handle_message(timeout_waiting_for_close_ok,
-               State = #state{closing_reason = Reason}) ->
-    {stop, {timeout_waiting_for_close_ok, Reason}, State};
 handle_message(socket_closing_timeout,
                State = #state{closing_reason = Reason}) ->
     {stop, {socket_closing_timeout, Reason}, State};
@@ -105,20 +102,28 @@ connect(AmqpParams = #amqp_params_network{host = Host}, SIF, ChMgr, State) ->
     end.
 
 do_connect({Addr, Family},
-           AmqpParams = #amqp_params_network{ssl_options = none,
-                                             port        = Port},
+           AmqpParams = #amqp_params_network{ssl_options        = none,
+                                             port               = Port,
+                                             connection_timeout = Timeout,
+                                             socket_options     = ExtraOpts},
            SIF, ChMgr, State) ->
-    case gen_tcp:connect(Addr, Port, [Family | ?RABBIT_TCP_OPTS]) of
+    case gen_tcp:connect(Addr, Port,
+                         [Family | ?RABBIT_TCP_OPTS] ++ ExtraOpts,
+                         Timeout) of
         {ok, Sock}     -> try_handshake(AmqpParams, SIF, ChMgr,
                                         State#state{sock = Sock});
         {error, _} = E -> E
     end;
 do_connect({Addr, Family},
-           AmqpParams = #amqp_params_network{ssl_options = SslOpts,
-                                             port        = Port},
+           AmqpParams = #amqp_params_network{ssl_options        = SslOpts,
+                                             port               = Port,
+                                             connection_timeout = Timeout,
+                                             socket_options     = ExtraOpts},
            SIF, ChMgr, State) ->
     rabbit_misc:start_applications([crypto, public_key, ssl]),
-    case gen_tcp:connect(Addr, Port, [Family | ?RABBIT_TCP_OPTS]) of
+    case gen_tcp:connect(Addr, Port,
+                         [Family | ?RABBIT_TCP_OPTS] ++ ExtraOpts,
+                         Timeout) of
         {ok, Sock} ->
             case ssl:connect(Sock, SslOpts) of
                 {ok, SslSock} ->
