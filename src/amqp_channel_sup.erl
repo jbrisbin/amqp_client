@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
 %%
 
 %% @private
@@ -44,12 +44,13 @@ start_link(Type, Connection, InfraArgs, ChNumber, Consumer = {_, _}) ->
 %% Internal plumbing
 %%---------------------------------------------------------------------------
 
-start_writer_fun(_Sup, direct, [ConnectionPid, Node, User, VHost, Collector],
+start_writer_fun(_Sup, direct, [ConnPid, ConnName, Node, User, VHost,
+                                Collector],
                  ChNumber) ->
     fun () ->
             {ok, RabbitCh} =
                 rpc:call(Node, rabbit_direct, start_channel,
-                         [ChNumber, self(), ConnectionPid, ?PROTOCOL, User,
+                         [ChNumber, self(), ConnPid, ConnName, ?PROTOCOL, User,
                           VHost, ?CLIENT_CAPABILITIES, Collector]),
             link(RabbitCh),
             {ok, RabbitCh}
