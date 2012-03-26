@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2011 VMware, Inc.  All rights reserved.
+%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
 %%
 
 %% @private
@@ -20,6 +20,8 @@
 -include("amqp_client.hrl").
 
 -behaviour(amqp_gen_connection).
+
+-export([server_close/3]).
 
 -export([init/1, terminate/2, connect/4, do/2, open_channel_args/1, i/2,
          info_keys/0, handle_message/2, closing/3, channels_terminated/1]).
@@ -41,14 +43,24 @@
 
 %%---------------------------------------------------------------------------
 
+%% amqp_connection:close() logically closes from the client end. We may
+%% want to close from the server end.
+server_close(ConnectionPid, Code, Text) ->
+    Close = #'connection.close'{reply_text =  Text,
+                                reply_code = Code,
+                                class_id   = 0,
+                                method_id  = 0},
+    amqp_gen_connection:server_close(ConnectionPid, Close).
+
 init([]) ->
     {ok, #state{}}.
 
 open_channel_args(#state{node = Node,
                          user = User,
                          vhost = VHost,
+                         adapter_info = Info,
                          collector = Collector}) ->
-    [self(), Node, User, VHost, Collector].
+    [self(), Info#adapter_info.name, Node, User, VHost, Collector].
 
 do(_Method, _State) ->
     ok.
@@ -129,9 +141,7 @@ ensure_adapter_info(A = #adapter_info{protocol = unknown}) ->
     ensure_adapter_info(A#adapter_info{protocol =
                                            {'Direct', ?PROTOCOL:version()}});
 
-ensure_adapter_info(A = #adapter_info{name         = unknown,
-                                      peer_address = unknown,
-                                      peer_port    = unknown}) ->
+ensure_adapter_info(A = #adapter_info{name = unknown}) ->
     Name = list_to_binary(rabbit_misc:pid_to_string(self())),
     ensure_adapter_info(A#adapter_info{name = Name});
 
