@@ -17,10 +17,9 @@
 %% @private
 -module(amqp_network_connection).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -behaviour(amqp_gen_connection).
-
 -export([init/1, terminate/2, connect/4, do/2, open_channel_args/1, i/2,
          info_keys/0, handle_message/2, closing/3, channels_terminated/1]).
 
@@ -68,7 +67,19 @@ handle_message({socket_error, _} = SocketError, State) ->
 handle_message({channel_exit, Reason}, State) ->
     {stop, {channel0_died, Reason}, State};
 handle_message(heartbeat_timeout, State) ->
-    {stop, heartbeat_timeout, State}.
+    {stop, heartbeat_timeout, State};
+handle_message(closing_timeout, State = #state{closing_reason = Reason}) ->
+    {stop, Reason, State};
+%% see http://erlang.org/pipermail/erlang-bugs/2012-June/002933.html
+handle_message({Ref, {error, Reason}},
+               State = #state{waiting_socket_close = Waiting,
+                              closing_reason       = CloseReason})
+  when is_reference(Ref) ->
+    {stop, case {Reason, Waiting} of
+               {closed,  true} -> {shutdown, CloseReason};
+               {closed, false} -> socket_closed_unexpectedly;
+               {_,          _} -> {socket_error, Reason}
+           end, State}.
 
 closing(_ChannelCloseType, Reason, State) ->
     {ok, State#state{closing_reason = Reason}}.
@@ -107,6 +118,7 @@ do_connect({Addr, Family},
                                              connection_timeout = Timeout,
                                              socket_options     = ExtraOpts},
            SIF, ChMgr, State) ->
+    obtain(),
     case gen_tcp:connect(Addr, Port,
                          [Family | ?RABBIT_TCP_OPTS] ++ ExtraOpts,
                          Timeout) of
@@ -120,7 +132,8 @@ do_connect({Addr, Family},
                                              connection_timeout = Timeout,
                                              socket_options     = ExtraOpts},
            SIF, ChMgr, State) ->
-    rabbit_misc:start_applications([crypto, public_key, ssl]),
+    app_utils:start_applications([crypto, public_key, ssl]),
+    obtain(),
     case gen_tcp:connect(Addr, Port,
                          [Family | ?RABBIT_TCP_OPTS] ++ ExtraOpts,
                          Timeout) of
@@ -137,9 +150,15 @@ do_connect({Addr, Family},
             E
     end.
 
+inet_address_preference() ->
+    case application:get_env(amqp_client, prefer_ipv6) of
+        {ok, true}  -> [inet6, inet];
+        {ok, false} -> [inet, inet6]
+    end.
+
 gethostaddr(Host) ->
     Lookups = [{Family, inet:getaddr(Host, Family)}
-               || Family <- [inet, inet6]],
+               || Family <- inet_address_preference()],
     [{IP, Family} || {Family, {ok, IP}} <- Lookups].
 
 try_handshake(AmqpParams, SIF, ChMgr, State) ->
@@ -295,4 +314,10 @@ handshake_recv(Expecting) ->
             _ ->
                 exit(handshake_receive_timed_out)
         end
+    end.
+
+obtain() ->
+    case code:is_loaded(file_handle_cache) of
+        false -> ok;
+        _     -> file_handle_cache:obtain()
     end.

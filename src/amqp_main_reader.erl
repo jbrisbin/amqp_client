@@ -17,7 +17,7 @@
 %% @private
 -module(amqp_main_reader).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -behaviour(gen_server).
 
@@ -54,7 +54,7 @@ terminate(_Reason, _State) ->
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
-    State.
+    {ok, State}.
 
 handle_call(Call, From, State) ->
     {stop, {unexpected_call, Call, From}, State}.

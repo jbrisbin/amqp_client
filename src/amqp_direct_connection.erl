@@ -17,7 +17,7 @@
 %% @private
 -module(amqp_direct_connection).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -behaviour(amqp_gen_connection).
 
@@ -60,7 +60,7 @@ open_channel_args(#state{node = Node,
                          vhost = VHost,
                          adapter_info = Info,
                          collector = Collector}) ->
-    [self(), Info#adapter_info.name, Node, User, VHost, Collector].
+    [self(), Info#amqp_adapter_info.name, Node, User, VHost, Collector].
 
 do(_Method, _State) ->
     ok.
@@ -69,7 +69,8 @@ handle_message(force_event_refresh, State = #state{node = Node}) ->
     rpc:call(Node, rabbit_event, notify,
              [connection_created, connection_info(State)]),
     {ok, State};
-
+handle_message(closing_timeout, State = #state{closing_reason = Reason}) ->
+    {stop, {closing_timeout, Reason}, State};
 handle_message(Msg, State) ->
     {stop, {unexpected_msg, Msg}, State}.
 
@@ -88,17 +89,18 @@ terminate(_Reason, #state{node = Node}) ->
 i(type, _State) -> direct;
 i(pid,  _State) -> self();
 %% AMQP Params
-i(user,              #state{params = P}) -> P#amqp_params_direct.username;
+i(user, #state{params=#amqp_params_direct{username=#user{username=U}}}) -> U;
+i(user, #state{params=#amqp_params_direct{username=U}}) -> U;
 i(vhost,             #state{params = P}) -> P#amqp_params_direct.virtual_host;
 i(client_properties, #state{params = P}) ->
     P#amqp_params_direct.client_properties;
 %% Optional adapter info
-i(protocol,     #state{adapter_info = I}) -> I#adapter_info.protocol;
-i(address,      #state{adapter_info = I}) -> I#adapter_info.address;
-i(port,         #state{adapter_info = I}) -> I#adapter_info.port;
-i(peer_address, #state{adapter_info = I}) -> I#adapter_info.peer_address;
-i(peer_port,    #state{adapter_info = I}) -> I#adapter_info.peer_port;
-i(name,         #state{adapter_info = I}) -> I#adapter_info.name;
+i(protocol,     #state{adapter_info = I}) -> I#amqp_adapter_info.protocol;
+i(address,      #state{adapter_info = I}) -> I#amqp_adapter_info.address;
+i(port,         #state{adapter_info = I}) -> I#amqp_adapter_info.port;
+i(peer_address, #state{adapter_info = I}) -> I#amqp_adapter_info.peer_address;
+i(peer_port,    #state{adapter_info = I}) -> I#amqp_adapter_info.peer_port;
+i(name,         #state{adapter_info = I}) -> I#amqp_adapter_info.name;
 
 i(Item, _State) -> throw({bad_argument, Item}).
 
@@ -109,9 +111,10 @@ infos(Items, State) ->
     [{Item, i(Item, State)} || Item <- Items].
 
 connection_info(State = #state{adapter_info = I}) ->
-    infos(?CREATION_EVENT_KEYS, State) ++ I#adapter_info.additional_info.
+    infos(?CREATION_EVENT_KEYS, State) ++ I#amqp_adapter_info.additional_info.
 
 connect(Params = #amqp_params_direct{username     = Username,
+                                     password     = Password,
                                      node         = Node,
                                      adapter_info = Info,
                                      virtual_host = VHost},
@@ -120,8 +123,12 @@ connect(Params = #amqp_params_direct{username     = Username,
                          vhost        = VHost,
                          params       = Params,
                          adapter_info = ensure_adapter_info(Info)},
+    AuthToken = case Password of
+                    none -> Username;
+                    _    -> {Username, Password}
+                end,
     case rpc:call(Node, rabbit_direct, connect,
-                  [Username, VHost, ?PROTOCOL, self(),
+                  [AuthToken, VHost, ?PROTOCOL, self(),
                    connection_info(State1)]) of
         {ok, {User, ServerProperties}} ->
             {ok, Collector} = SIF(),
@@ -135,14 +142,14 @@ connect(Params = #amqp_params_direct{username     = Username,
     end.
 
 ensure_adapter_info(none) ->
-    ensure_adapter_info(#adapter_info{});
+    ensure_adapter_info(#amqp_adapter_info{});
 
-ensure_adapter_info(A = #adapter_info{protocol = unknown}) ->
-    ensure_adapter_info(A#adapter_info{protocol =
-                                           {'Direct', ?PROTOCOL:version()}});
+ensure_adapter_info(A = #amqp_adapter_info{protocol = unknown}) ->
+    ensure_adapter_info(A#amqp_adapter_info{
+                          protocol = {'Direct', ?PROTOCOL:version()}});
 
-ensure_adapter_info(A = #adapter_info{name = unknown}) ->
+ensure_adapter_info(A = #amqp_adapter_info{name = unknown}) ->
     Name = list_to_binary(rabbit_misc:pid_to_string(self())),
-    ensure_adapter_info(A#adapter_info{name = Name});
+    ensure_adapter_info(A#amqp_adapter_info{name = Name});
 
 ensure_adapter_info(Info) -> Info.

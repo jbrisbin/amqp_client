@@ -62,14 +62,15 @@
 %% See type definitions below.
 -module(amqp_channel).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -behaviour(gen_server).
 
 -export([call/2, call/3, cast/2, cast/3, cast_flow/3]).
 -export([close/1, close/3]).
--export([register_return_handler/2, register_flow_handler/2,
-         register_confirm_handler/2]).
+-export([register_return_handler/2, unregister_return_handler/1,
+         register_flow_handler/2, unregister_flow_handler/1,
+         register_confirm_handler/2, unregister_confirm_handler/1]).
 -export([call_consumer/2, subscribe/3]).
 -export([next_publish_seqno/1, wait_for_confirms/1, wait_for_confirms/2,
          wait_for_confirms_or_die/1, wait_for_confirms_or_die/2]).
@@ -84,20 +85,20 @@
                 connection,
                 consumer,
                 driver,
-                rpc_requests        = queue:new(),
-                closing             = false, %% false |
-                                             %%   {just_channel, Reason} |
-                                             %%   {connection, Reason}
+                rpc_requests       = queue:new(),
+                closing            = false, %% false |
+                                            %%   {just_channel, Reason} |
+                                            %%   {connection, Reason}
                 writer,
-                return_handler_pid  = none,
-                confirm_handler_pid = none,
-                next_pub_seqno      = 0,
-                flow_active         = true,
-                flow_handler_pid    = none,
+                return_handler     = none,
+                confirm_handler    = none,
+                next_pub_seqno     = 0,
+                flow_active        = true,
+                flow_handler       = none,
                 start_writer_fun,
-                unconfirmed_set     = gb_sets:new(),
-                waiting_set         = gb_trees:empty(),
-                only_acks_received  = true
+                unconfirmed_set    = gb_sets:new(),
+                waiting_set        = gb_trees:empty(),
+                only_acks_received = true
                }).
 
 %%---------------------------------------------------------------------------
@@ -263,6 +264,14 @@ wait_for_confirms_or_die(Channel, Timeout) ->
 register_return_handler(Channel, ReturnHandler) ->
     gen_server:cast(Channel, {register_return_handler, ReturnHandler} ).
 
+%% @spec (Channel) -> ok
+%% where
+%%      Channel = pid()
+%% @doc Removes the return handler, if it exists. Does nothing if there is no
+%% such handler.
+unregister_return_handler(Channel) ->
+    gen_server:cast(Channel, unregister_return_handler).
+
 %% @spec (Channel, ConfirmHandler) -> ok
 %% where
 %%      Channel = pid()
@@ -274,6 +283,14 @@ register_return_handler(Channel, ReturnHandler) ->
 register_confirm_handler(Channel, ConfirmHandler) ->
     gen_server:cast(Channel, {register_confirm_handler, ConfirmHandler} ).
 
+%% @spec (Channel) -> ok
+%% where
+%%      Channel = pid()
+%% @doc Removes the confirm handler, if it exists. Does nothing if there is no
+%% such handler.
+unregister_confirm_handler(Channel) ->
+    gen_server:cast(Channel, unregister_confirm_handler).
+
 %% @spec (Channel, FlowHandler) -> ok
 %% where
 %%      Channel = pid()
@@ -282,6 +299,14 @@ register_confirm_handler(Channel, ConfirmHandler) ->
 %% The registered process will receive #channel.flow{} records.
 register_flow_handler(Channel, FlowHandler) ->
     gen_server:cast(Channel, {register_flow_handler, FlowHandler} ).
+
+%% @spec (Channel) -> ok
+%% where
+%%      Channel = pid()
+%% @doc Removes the flow handler, if it exists. Does nothing if there is no
+%% such handler.
+unregister_flow_handler(Channel) ->
+    gen_server:cast(Channel, unregister_flow_handler).
 
 %% @spec (Channel, Msg) -> ok
 %% where
@@ -376,16 +401,31 @@ handle_cast({cast, Method, AmqpMsg, Sender, flow}, State) ->
     handle_method_to_server(Method, AmqpMsg, none, Sender, flow, State);
 %% @private
 handle_cast({register_return_handler, ReturnHandler}, State) ->
-    erlang:monitor(process, ReturnHandler),
-    {noreply, State#state{return_handler_pid = ReturnHandler}};
+    Ref = erlang:monitor(process, ReturnHandler),
+    {noreply, State#state{return_handler = {ReturnHandler, Ref}}};
+%% @private
+handle_cast(unregister_return_handler,
+            State = #state{return_handler = {_ReturnHandler, Ref}}) ->
+    erlang:demonitor(Ref),
+    {noreply, State#state{return_handler = none}};
 %% @private
 handle_cast({register_confirm_handler, ConfirmHandler}, State) ->
-    erlang:monitor(process, ConfirmHandler),
-    {noreply, State#state{confirm_handler_pid = ConfirmHandler}};
+    Ref = erlang:monitor(process, ConfirmHandler),
+    {noreply, State#state{confirm_handler = {ConfirmHandler, Ref}}};
+%% @private
+handle_cast(unregister_confirm_handler,
+            State = #state{confirm_handler = {_ConfirmHandler, Ref}}) ->
+    erlang:demonitor(Ref),
+    {noreply, State#state{confirm_handler = none}};
 %% @private
 handle_cast({register_flow_handler, FlowHandler}, State) ->
-    erlang:monitor(process, FlowHandler),
-    {noreply, State#state{flow_handler_pid = FlowHandler}};
+    Ref = erlang:monitor(process, FlowHandler),
+    {noreply, State#state{flow_handler = {FlowHandler, Ref}}};
+%% @private
+handle_cast(unregister_flow_handler,
+            State = #state{flow_handler = {_FlowHandler, Ref}}) ->
+    erlang:demonitor(Ref),
+    {noreply, State#state{flow_handler = none}};
 %% Received from channels manager
 %% @private
 handle_cast({method, Method, Content, noflow}, State) ->
@@ -433,22 +473,22 @@ handle_info(timed_out_flushing_channel, State) ->
     {stop, timed_out_flushing_channel, State};
 %% @private
 handle_info({'DOWN', _, process, ReturnHandler, Reason},
-            State = #state{return_handler_pid = ReturnHandler}) ->
+            State = #state{return_handler = {ReturnHandler, _Ref}}) ->
     ?LOG_WARN("Channel (~p): Unregistering return handler ~p because it died. "
               "Reason: ~p~n", [self(), ReturnHandler, Reason]),
-    {noreply, State#state{return_handler_pid = none}};
+    {noreply, State#state{return_handler = none}};
 %% @private
 handle_info({'DOWN', _, process, ConfirmHandler, Reason},
-            State = #state{confirm_handler_pid = ConfirmHandler}) ->
+            State = #state{confirm_handler = {ConfirmHandler, _Ref}}) ->
     ?LOG_WARN("Channel (~p): Unregistering confirm handler ~p because it died. "
               "Reason: ~p~n", [self(), ConfirmHandler, Reason]),
-    {noreply, State#state{confirm_handler_pid = none}};
+    {noreply, State#state{confirm_handler = none}};
 %% @private
 handle_info({'DOWN', _, process, FlowHandler, Reason},
-            State = #state{flow_handler_pid = FlowHandler}) ->
+            State = #state{flow_handler = {FlowHandler, _Ref}}) ->
     ?LOG_WARN("Channel (~p): Unregistering flow handler ~p because it died. "
               "Reason: ~p~n", [self(), FlowHandler, Reason]),
-    {noreply, State#state{flow_handler_pid = none}};
+    {noreply, State#state{flow_handler = none}};
 handle_info({'DOWN', _, process, QPid, _Reason}, State) ->
     rabbit_amqqueue:notify_sent_queue_down(QPid),
     {noreply, State};
@@ -648,9 +688,9 @@ handle_method_from_server1(#'basic.deliver'{} = Deliver, AmqpMsg, State) ->
     ok = call_to_consumer(Deliver, AmqpMsg, State),
     {noreply, State};
 handle_method_from_server1(#'channel.flow'{active = Active} = Flow, none,
-                           State = #state{flow_handler_pid = FlowHandler}) ->
-    case FlowHandler of none -> ok;
-                        _    -> FlowHandler ! Flow
+                           State = #state{flow_handler = FlowHandler}) ->
+    case FlowHandler of none        -> ok;
+                        {Pid, _Ref} -> Pid ! Flow
     end,
     %% Putting the flow_ok in the queue so that the RPC queue can be
     %% flushed beforehand. Methods that made it to the queue are not
@@ -659,32 +699,32 @@ handle_method_from_server1(#'channel.flow'{active = Active} = Flow, none,
                            none, noflow, State#state{flow_active = Active})};
 handle_method_from_server1(
         #'basic.return'{} = BasicReturn, AmqpMsg,
-        State = #state{return_handler_pid = ReturnHandler}) ->
+        State = #state{return_handler = ReturnHandler}) ->
     case ReturnHandler of
-        none -> ?LOG_WARN("Channel (~p): received {~p, ~p} but there is no "
-                          "return handler registered~n",
-                          [self(), BasicReturn, AmqpMsg]);
-        _    -> ReturnHandler ! {BasicReturn, AmqpMsg}
+        none        -> ?LOG_WARN("Channel (~p): received {~p, ~p} but there is "
+                                 "no return handler registered~n",
+                                 [self(), BasicReturn, AmqpMsg]);
+        {Pid, _Ref} -> Pid ! {BasicReturn, AmqpMsg}
     end,
     {noreply, State};
 handle_method_from_server1(#'basic.ack'{} = BasicAck, none,
-                           #state{confirm_handler_pid = none} = State) ->
+                           #state{confirm_handler = none} = State) ->
     ?LOG_WARN("Channel (~p): received ~p but there is no "
               "confirm handler registered~n", [self(), BasicAck]),
     {noreply, update_confirm_set(BasicAck, State)};
 handle_method_from_server1(
         #'basic.ack'{} = BasicAck, none,
-        #state{confirm_handler_pid = ConfirmHandler} = State) ->
+        #state{confirm_handler = {ConfirmHandler, _Ref}} = State) ->
     ConfirmHandler ! BasicAck,
     {noreply, update_confirm_set(BasicAck, State)};
 handle_method_from_server1(#'basic.nack'{} = BasicNack, none,
-                           #state{confirm_handler_pid = none} = State) ->
+                           #state{confirm_handler = none} = State) ->
     ?LOG_WARN("Channel (~p): received ~p but there is no "
               "confirm handler registered~n", [self(), BasicNack]),
     {noreply, update_confirm_set(BasicNack, State)};
 handle_method_from_server1(
         #'basic.nack'{} = BasicNack, none,
-        #state{confirm_handler_pid = ConfirmHandler} = State) ->
+        #state{confirm_handler = {ConfirmHandler, _Ref}} = State) ->
     ConfirmHandler ! BasicNack,
     {noreply, update_confirm_set(BasicNack, State)};
 
@@ -712,25 +752,19 @@ handle_connection_closing(CloseType, Reason,
             handle_shutdown({connection_closing, Reason}, NewState)
     end.
 
-handle_channel_exit(Reason, State = #state{connection = Connection}) ->
-    case Reason of
-        %% Sent by rabbit_channel in the direct case
-        #amqp_error{name = ErrorName, explanation = Expl} ->
-            ?LOG_WARN("Channel (~p) closing: server sent error ~p~n",
-                      [self(), Reason]),
-            {IsHard, Code, _} = ?PROTOCOL:lookup_amqp_exception(ErrorName),
-            ReportedReason = {server_initiated_close, Code, Expl},
-            handle_shutdown(
-                if IsHard ->
-                             amqp_gen_connection:hard_error_in_channel(
-                                 Connection, self(), ReportedReason),
-                             {connection_closing, ReportedReason};
-                   true   -> ReportedReason
-                end, State);
-        %% Unexpected death of a channel infrastructure process
-        _ ->
-            {stop, {infrastructure_died, Reason}, State}
-    end.
+handle_channel_exit(Reason = #amqp_error{name = ErrorName, explanation = Expl},
+                    State = #state{connection = Connection, number = Number}) ->
+    %% Sent by rabbit_channel for hard errors in the direct case
+    ?LOG_ERR("connection ~p, channel ~p - error:~n~p~n",
+             [Connection, Number, Reason]),
+    {true, Code, _} = ?PROTOCOL:lookup_amqp_exception(ErrorName),
+    ReportedReason = {server_initiated_close, Code, Expl},
+    amqp_gen_connection:hard_error_in_channel(
+      Connection, self(), ReportedReason),
+    handle_shutdown({connection_closing, ReportedReason}, State);
+handle_channel_exit(Reason, State) ->
+    %% Unexpected death of a channel infrastructure process
+    {stop, {infrastructure_died, Reason}, State}.
 
 handle_shutdown({_, 200, _}, State) ->
     {stop, normal, State};
@@ -854,16 +888,15 @@ handle_wait_for_confirms(From, Timeout,
                          State = #state{unconfirmed_set = USet,
                                         waiting_set     = WSet}) ->
     case gb_sets:is_empty(USet) of
-        true ->
-            {reply, true, State};
-        false ->
-            TRef = case Timeout of
-                       infinity -> undefined;
-                       _        -> erlang:send_after(Timeout * 1000, self(),
-                                                     {confirm_timeout, From})
-                   end,
-            {noreply,
-             State#state{waiting_set = gb_trees:insert(From, TRef, WSet)}}
+        true  -> {reply, true, State};
+        false -> TRef = case Timeout of
+                            infinity -> undefined;
+                            _        -> erlang:send_after(
+                                          Timeout * 1000, self(),
+                                          {confirm_timeout, From})
+                        end,
+                 {noreply,
+                  State#state{waiting_set = gb_trees:insert(From, TRef, WSet)}}
     end.
 
 call_to_consumer(Method, Args, #state{consumer = Consumer}) ->
