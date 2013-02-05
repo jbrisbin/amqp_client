@@ -204,10 +204,8 @@ handle_call({consumer_call, Msg}, From,
             {noreply, State#state{module_state = NewMState}};
         {reply, Reply, NewMState} ->
             {reply, Reply, State#state{module_state = NewMState}};
-        {error, {consumer_died, Reason}, NewMState} ->
-            {stop, Reason, State#state{module_state = NewMState}};
         {error, Reason, NewMState} ->
-            {stop, {error, Reason},
+            {stop, {error, Reason}, {error, Reason},
              State#state{module_state = NewMState}}
     end;
 handle_call({consumer_call, Method, Args}, _From,
