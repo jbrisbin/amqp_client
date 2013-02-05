@@ -229,10 +229,8 @@ handle_call({consumer_call, Method, Args}, _From,
     case Return of
         {ok, NewMState} ->
             {reply, ok, State#state{module_state = NewMState}};
-        {error, {consumer_died, Reason}, NewMState} ->
-            {stop, Reason, State#state{module_state = NewMState}};
         {error, Reason, NewMState} ->
-            {stop, {error, Reason},
+            {stop, {error, Reason}, {error, Reason},
              State#state{module_state = NewMState}}
     end.
 
@@ -244,8 +242,6 @@ handle_info(Info, State = #state{module_state = MState,
     case ConsumerModule:handle_info(Info, MState) of
         {ok, NewMState} ->
             {noreply, State#state{module_state = NewMState}};
-        {error, {consumer_died, Reason}, NewMState} ->
-            {stop, Reason, State#state{module_state = NewMState}};
         {error, Reason, NewMState} ->
             {stop, {error, Reason}, State#state{module_state = NewMState}}
     end.
