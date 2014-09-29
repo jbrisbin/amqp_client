@@ -10,19 +10,38 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(amqp_uri).
 
 -include("amqp_client.hrl").
 
--export([parse/1, parse/2]).
+-export([parse/1, parse/2, remove_credentials/1]).
 
 %%---------------------------------------------------------------------------
 %% AMQP URI Parsing
 %%---------------------------------------------------------------------------
+
+%% Reformat a URI to remove authentication secrets from it (before we
+%% log it or display it anywhere).
+remove_credentials(URI) ->
+    Props = uri_parser:parse(URI,
+                             [{host, undefined}, {path, undefined},
+                              {port, undefined}, {'query', []}]),
+    PortPart = case proplists:get_value(port, Props) of
+                   undefined -> "";
+                   Port      -> rabbit_misc:format(":~B", [Port])
+               end,
+    PGet = fun(K, P) -> case proplists:get_value(K, P) of
+                            undefined -> "";
+                            R         -> R
+                        end
+           end,
+    rabbit_misc:format(
+      "~s://~s~s~s", [proplists:get_value(scheme, Props), PGet(host, Props),
+                      PortPart,                           PGet(path, Props)]).
 
 %% @spec (Uri) -> {ok, #amqp_params_network{} | #amqp_params_direct{}} |
 %%                {error, {Info, Uri}}
@@ -34,25 +53,19 @@
 %% default values are used.  If the hostname is zero-length, an
 %% #amqp_params_direct{} record is returned; otherwise, an
 %% #amqp_params_network{} record is returned.  Extra parameters may be
-%% specified via the query string (e.g. "?heartbeat=5"). In case of
-%% failure, an {error, {Info, Uri}} tuple is returned.
+%% specified via the query string
+%% (e.g. "?heartbeat=5&amp;auth_mechanism=external"). In case of failure,
+%% an {error, {Info, Uri}} tuple is returned.
 %%
 %% The extra parameters that may be specified are channel_max,
-%% frame_max, and heartbeat.  The extra parameters that may be
-%% specified for an SSL connection are cacertfile, certfile, keyfile,
-%% verify, and fail_if_no_peer_cert.
+%% frame_max, heartbeat and auth_mechanism (the latter can appear more
+%% than once).  The extra parameters that may be specified for an SSL
+%% connection are cacertfile, certfile, keyfile, verify, and
+%% fail_if_no_peer_cert.
 parse(Uri) -> parse(Uri, <<"/">>).
 
 parse(Uri, DefaultVHost) ->
-    try case parse1(Uri, DefaultVHost) of
-            {ok, #amqp_params_network{host         = undefined,
-                                      username     = User,
-                                      virtual_host = Vhost}} ->
-                return({ok, #amqp_params_direct{username     = User,
-                                                virtual_host = Vhost}});
-            {ok, Params} ->
-                return({ok, Params})
-        end
+    try return(parse1(Uri, DefaultVHost))
     catch throw:Err -> {error, {Err, Uri}};
           error:Err -> {error, {Err, Uri}}
     end.
@@ -104,18 +117,37 @@ build_broker(ParsedUri, DefaultVHost) ->
                              end
             end,
     UserInfo = proplists:get_value(userinfo, ParsedUri),
-    Ps = #amqp_params_network{host            = unescape_string(Host),
-                              port            = Port,
-                              virtual_host    = VHost,
-                              auth_mechanisms = mechanisms(ParsedUri)},
+    set_user_info(case unescape_string(Host) of
+                      undefined -> #amqp_params_direct{virtual_host = VHost};
+                      Host1     -> Mech = mechanisms(ParsedUri),
+                                   #amqp_params_network{host            = Host1,
+                                                        port            = Port,
+                                                        virtual_host    = VHost,
+                                                        auth_mechanisms = Mech}
+                  end, UserInfo).
+
+set_user_info(Ps, UserInfo) ->
     case UserInfo of
-        [U, P | _] -> Ps#amqp_params_network{
-                        username = list_to_binary(unescape_string(U)),
-                        password = list_to_binary(unescape_string(P))};
-        [U | _]    -> Ps#amqp_params_network{
-                        username = list_to_binary(unescape_string(U))};
-        _          -> Ps
+        [U, P | _] -> set([{username, list_to_binary(unescape_string(U))},
+                           {password, list_to_binary(unescape_string(P))}], Ps);
+
+        [U]        -> set([{username, list_to_binary(unescape_string(U))}], Ps);
+        []         -> Ps
     end.
+
+set(KVs, Ps = #amqp_params_direct{}) ->
+    set(KVs, Ps, record_info(fields, amqp_params_direct));
+set(KVs, Ps = #amqp_params_network{}) ->
+    set(KVs, Ps, record_info(fields, amqp_params_network)).
+
+set(KVs, Ps, Fields) ->
+    {Ps1, _Ix} = lists:foldl(fun (Field, {PsN, Ix}) ->
+                                     {case lists:keyfind(Field, 1, KVs) of
+                                          false  -> PsN;
+                                          {_, V} -> setelement(Ix, PsN, V)
+                                      end, Ix + 1}
+                             end, {Ps, 2}, Fields),
+    Ps1.
 
 build_ssl_broker(ParsedUri, DefaultVHost) ->
     Params = build_broker(ParsedUri, DefaultVHost),
@@ -142,6 +174,8 @@ build_ssl_broker(ParsedUri, DefaultVHost) ->
           []),
     Params#amqp_params_network{ssl_options = SSLOptions}.
 
+broker_add_query(Params = #amqp_params_direct{}, Uri) ->
+    broker_add_query(Params, Uri, record_info(fields, amqp_params_direct));
 broker_add_query(Params = #amqp_params_network{}, Uri) ->
     broker_add_query(Params, Uri, record_info(fields, amqp_params_network)).
 
@@ -170,9 +204,10 @@ broker_add_query(Params, ParsedUri, Fields) ->
            end || Field <- Fields], {Params, 2}),
     Params1.
 
-parse_amqp_param(Field, String) when Field =:= channel_max orelse
-                                     Field =:= frame_max   orelse
-                                     Field =:= heartbeat   ->
+parse_amqp_param(Field, String) when Field =:= channel_max        orelse
+                                     Field =:= frame_max          orelse
+                                     Field =:= heartbeat          orelse
+                                     Field =:= connection_timeout ->
     try return(list_to_integer(String))
     catch error:badarg -> fail({not_an_integer, String})
     end;

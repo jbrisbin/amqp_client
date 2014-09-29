@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @type close_reason(Type) = {shutdown, amqp_reason(Type)}.
@@ -74,7 +74,7 @@
 -export([call_consumer/2, subscribe/3]).
 -export([next_publish_seqno/1, wait_for_confirms/1, wait_for_confirms/2,
          wait_for_confirms_or_die/1, wait_for_confirms_or_die/2]).
--export([start_link/5, connection_closing/3, open/1]).
+-export([start_link/5, set_writer/2, connection_closing/3, open/1]).
 
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2]).
@@ -95,7 +95,6 @@
                 next_pub_seqno     = 0,
                 flow_active        = true,
                 flow_handler       = none,
-                start_writer_fun,
                 unconfirmed_set    = gb_sets:new(),
                 waiting_set        = gb_trees:empty(),
                 only_acks_received = true
@@ -214,7 +213,7 @@ next_publish_seqno(Channel) ->
 %%      Channel = pid()
 %% @doc Wait until all messages published since the last call have
 %% been either ack'd or nack'd by the broker.  Note, when called on a
-%% non-Confirm channel, waitForConfirms returns true immediately.
+%% non-Confirm channel, waitForConfirms returns an error.
 wait_for_confirms(Channel) ->
     wait_for_confirms(Channel, infinity).
 
@@ -224,10 +223,13 @@ wait_for_confirms(Channel) ->
 %%      Timeout = non_neg_integer() | 'infinity'
 %% @doc Wait until all messages published since the last call have
 %% been either ack'd or nack'd by the broker or the timeout expires.
-%% Note, when called on a non-Confirm channel, waitForConfirms returns
-%% true immediately.
+%% Note, when called on a non-Confirm channel, waitForConfirms throws
+%% an exception.
 wait_for_confirms(Channel, Timeout) ->
-    gen_server:call(Channel, {wait_for_confirms, Timeout}, infinity).
+    case gen_server:call(Channel, {wait_for_confirms, Timeout}, infinity) of
+        {error, Reason} -> throw(Reason);
+        Other           -> Other
+    end.
 
 %% @spec (Channel) -> true
 %% where
@@ -333,9 +335,12 @@ subscribe(Channel, BasicConsume = #'basic.consume'{}, Subscriber) ->
 %%---------------------------------------------------------------------------
 
 %% @private
-start_link(Driver, Connection, ChannelNumber, Consumer, SWF) ->
+start_link(Driver, Connection, ChannelNumber, Consumer, Identity) ->
     gen_server:start_link(
-        ?MODULE, [Driver, Connection, ChannelNumber, Consumer, SWF], []).
+      ?MODULE, [Driver, Connection, ChannelNumber, Consumer, Identity], []).
+
+set_writer(Pid, Writer) ->
+    gen_server:cast(Pid, {set_writer, Writer}).
 
 %% @private
 connection_closing(Pid, ChannelCloseType, Reason) ->
@@ -350,12 +355,12 @@ open(Pid) ->
 %%---------------------------------------------------------------------------
 
 %% @private
-init([Driver, Connection, ChannelNumber, Consumer, SWF]) ->
-    {ok, #state{connection       = Connection,
-                driver           = Driver,
-                number           = ChannelNumber,
-                consumer         = Consumer,
-                start_writer_fun = SWF}}.
+init([Driver, Connection, ChannelNumber, Consumer, Identity]) ->
+    ?store_proc_name(Identity),
+    {ok, #state{connection = Connection,
+                driver     = Driver,
+                number     = ChannelNumber,
+                consumer   = Consumer}}.
 
 %% @private
 handle_call(open, From, State) ->
@@ -393,6 +398,9 @@ handle_call({subscribe, BasicConsume, Subscriber}, From, State) ->
     handle_method_to_server(BasicConsume, none, From, Subscriber, noflow,
                             State).
 
+%% @private
+handle_cast({set_writer, Writer}, State) ->
+    {noreply, State#state{writer = Writer}};
 %% @private
 handle_cast({cast, Method, AmqpMsg, Sender, noflow}, State) ->
     handle_method_to_server(Method, AmqpMsg, none, Sender, noflow, State);
@@ -503,6 +511,7 @@ handle_info({confirm_timeout, From}, State = #state{waiting_set = WSet}) ->
 
 %% @private
 terminate(_Reason, State) ->
+    flush_writer(State),
     State.
 
 %% @private
@@ -589,7 +598,7 @@ do_rpc(State = #state{rpc_requests = Q,
                              {_, ok}   -> gen_server:reply(From, ok);
                              _         -> ok
                              %% Do not reply if error in do. Expecting
-                             %% {channel_exit, ...}
+                             %% {channel_exit, _, _}
                          end,
                          do_rpc(State1#state{rpc_requests = NewQ})
             end;
@@ -608,12 +617,13 @@ pending_rpc_method(#state{rpc_requests = Q}) ->
     {value, {_From, _Sender, Method, _Content, _Flow}} = queue:peek(Q),
     Method.
 
-pre_do(#'channel.open'{}, none, _Sender, State) ->
-    start_writer(State);
 pre_do(#'channel.close'{reply_code = Code, reply_text = Text}, none,
        _Sender, State) ->
     State#state{closing = {just_channel, {app_initiated_close, Code, Text}}};
 pre_do(#'basic.consume'{} = Method, none, Sender, State) ->
+    ok = call_to_consumer(Method, Sender, State),
+    State;
+pre_do(#'basic.cancel'{} = Method, none, Sender, State) ->
     ok = call_to_consumer(Method, Sender, State),
     State;
 pre_do(_, _, _, State) ->
@@ -709,23 +719,19 @@ handle_method_from_server1(
     {noreply, State};
 handle_method_from_server1(#'basic.ack'{} = BasicAck, none,
                            #state{confirm_handler = none} = State) ->
-    ?LOG_WARN("Channel (~p): received ~p but there is no "
-              "confirm handler registered~n", [self(), BasicAck]),
     {noreply, update_confirm_set(BasicAck, State)};
-handle_method_from_server1(
-        #'basic.ack'{} = BasicAck, none,
-        #state{confirm_handler = {ConfirmHandler, _Ref}} = State) ->
-    ConfirmHandler ! BasicAck,
+handle_method_from_server1(#'basic.ack'{} = BasicAck, none,
+                           #state{confirm_handler = {CH, _Ref}} = State) ->
+    CH ! BasicAck,
     {noreply, update_confirm_set(BasicAck, State)};
 handle_method_from_server1(#'basic.nack'{} = BasicNack, none,
                            #state{confirm_handler = none} = State) ->
     ?LOG_WARN("Channel (~p): received ~p but there is no "
               "confirm handler registered~n", [self(), BasicNack]),
     {noreply, update_confirm_set(BasicNack, State)};
-handle_method_from_server1(
-        #'basic.nack'{} = BasicNack, none,
-        #state{confirm_handler = {ConfirmHandler, _Ref}} = State) ->
-    ConfirmHandler ! BasicNack,
+handle_method_from_server1(#'basic.nack'{} = BasicNack, none,
+                           #state{confirm_handler = {CH, _Ref}} = State) ->
+    CH ! BasicNack,
     {noreply, update_confirm_set(BasicNack, State)};
 
 handle_method_from_server1(Method, none, State) ->
@@ -779,21 +785,31 @@ handle_shutdown(Reason, State) ->
 %% Internal plumbing
 %%---------------------------------------------------------------------------
 
-do(Method, Content, Flow, #state{driver = Driver, writer = W}) ->
+do(Method, Content, Flow, #state{driver = network, writer = W}) ->
     %% Catching because it expects the {channel_exit, _, _} message on error
-    catch case {Driver, Content, Flow} of
-              {network, none, _}  -> rabbit_writer:send_command_sync(W, Method);
-              {network, _, _}     -> rabbit_writer:send_command_sync(W, Method,
-                                                                     Content);
-              {direct, none, _}   -> rabbit_channel:do(W, Method);
-              {direct, _, flow}   -> rabbit_channel:do_flow(W, Method, Content);
-              {direct, _, noflow} -> rabbit_channel:do(W, Method, Content)
+    catch case {Content, Flow} of
+              {none, _}      -> rabbit_writer:send_command(W, Method);
+              {_,    flow}   -> rabbit_writer:send_command_flow(W, Method,
+                                                                Content);
+              {_,    noflow} -> rabbit_writer:send_command(W, Method, Content)
+          end;
+do(Method, Content, Flow, #state{driver = direct, writer = W}) ->
+    %% ditto catching because...
+    catch case {Content, Flow} of
+              {none, _}      -> rabbit_channel:do(W, Method);
+              {_,    flow}   -> rabbit_channel:do_flow(W, Method, Content);
+              {_,    noflow} -> rabbit_channel:do(W, Method, Content)
           end.
 
-start_writer(State = #state{start_writer_fun = SWF}) ->
-    {ok, Writer} = SWF(),
-    State#state{writer = Writer}.
 
+flush_writer(#state{driver = network, writer = Writer}) ->
+    try
+        rabbit_writer:flush(Writer)
+    catch
+        exit:noproc -> ok
+    end;
+flush_writer(#state{driver = direct}) ->
+    ok.
 amqp_msg(none) ->
     none;
 amqp_msg(Content) ->
@@ -884,6 +900,8 @@ notify_confirm_waiters(State = #state{waiting_set        = WSet,
     State#state{waiting_set        = gb_trees:empty(),
                 only_acks_received = true}.
 
+handle_wait_for_confirms(_From, _Timeout, State = #state{next_pub_seqno = 0}) ->
+    {reply, {error, not_in_confirm_mode}, State};
 handle_wait_for_confirms(From, Timeout,
                          State = #state{unconfirmed_set = USet,
                                         waiting_set     = WSet}) ->

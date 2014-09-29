@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -ifndef(AMQP_CLIENT_HRL).
@@ -38,7 +38,7 @@
                               client_properties  = [],
                               socket_options     = []}).
 
--record(amqp_params_direct, {username          = <<"guest">>,
+-record(amqp_params_direct, {username          = none,
                              password          = none,
                              virtual_host      = <<"/">>,
                              node              = node(),

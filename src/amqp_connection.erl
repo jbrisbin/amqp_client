@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @type close_reason(Type) = {shutdown, amqp_reason(Type)}.
@@ -69,10 +69,11 @@
 
 -include("amqp_client_internal.hrl").
 
--export([open_channel/1, open_channel/2, open_channel/3]).
+-export([open_channel/1, open_channel/2, open_channel/3, register_blocked_handler/2]).
 -export([start/1, close/1, close/2, close/3]).
 -export([error_atom/1]).
 -export([info/2, info_keys/1, info_keys/0]).
+-export([socket_adapter_info/2]).
 
 -define(DEFAULT_CONSUMER, {amqp_selective_consumer, []}).
 
@@ -167,15 +168,16 @@ start(AmqpParams) ->
 %% application controller is in the process of shutting down the very
 %% application which is making this call.
 ensure_started() ->
-    case application_controller:get_master(amqp_client) of
-        undefined ->
-            case amqp_client:start() of
-                ok                                      -> ok;
-                {error, {already_started, amqp_client}} -> ok;
-                {error, _} = E                          -> throw(E)
-            end;
-        _ ->
-            ok
+    [ensure_started(App) || App <- [xmerl, amqp_client]].
+
+ensure_started(App) ->
+    case application_controller:get_master(App) of
+        undefined -> case application:start(App) of
+                         ok                              -> ok;
+                         {error, {already_started, App}} -> ok;
+                         {error, _} = E                  -> throw(E)
+                     end;
+        _         -> ok
     end.
 
 %%---------------------------------------------------------------------------
@@ -267,6 +269,9 @@ close(ConnectionPid, Code, Text, Timeout) ->
                                 method_id  = 0},
     amqp_gen_connection:close(ConnectionPid, Close, Timeout).
 
+register_blocked_handler(ConnectionPid, BlockHandler) ->
+    amqp_gen_connection:register_blocked_handler(ConnectionPid, BlockHandler).
+
 %%---------------------------------------------------------------------------
 %% Other functions
 %%---------------------------------------------------------------------------
@@ -332,3 +337,8 @@ info_keys(ConnectionPid) ->
 %% atoms that can be used for a certain connection, use info_keys/1.
 info_keys() ->
     amqp_gen_connection:info_keys().
+
+%% @doc Takes a socket and a protocol, returns an #amqp_adapter_info{}
+%% based on the socket for the protocol given.
+socket_adapter_info(Sock, Protocol) ->
+    amqp_direct_connection:socket_adapter_info(Sock, Protocol).

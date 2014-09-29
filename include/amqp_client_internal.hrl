@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -include("amqp_client.hrl").
@@ -28,7 +28,10 @@
 -define(LOG_WARN(Format, Args), error_logger:warning_msg(Format, Args)).
 -define(LOG_ERR(Format, Args),  error_logger:error_msg(Format, Args)).
 
--define(CLIENT_CAPABILITIES, [{<<"publisher_confirms">>,         bool, true},
-                              {<<"exchange_exchange_bindings">>, bool, true},
-                              {<<"basic.nack">>,                 bool, true},
-                              {<<"consumer_cancel_notify">>,     bool, true}]).
+-define(CLIENT_CAPABILITIES,
+    [{<<"publisher_confirms">>,           bool, true},
+     {<<"exchange_exchange_bindings">>,   bool, true},
+     {<<"basic.nack">>,                   bool, true},
+     {<<"consumer_cancel_notify">>,       bool, true},
+     {<<"connection.blocked">>,           bool, true},
+     {<<"authentication_failure_close">>, bool, true}]).
