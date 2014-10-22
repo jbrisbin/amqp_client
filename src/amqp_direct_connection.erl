@@ -34,14 +34,16 @@
                 params,
                 adapter_info,
                 collector,
-                closing_reason %% undefined | Reason
+                closing_reason, %% undefined | Reason
+                connected_at
                }).
 
 -define(INFO_KEYS, [type]).
 
 -define(CREATION_EVENT_KEYS, [pid, protocol, host, port, name,
                               peer_host, peer_port,
-                              user, vhost, client_properties, type]).
+                              user, vhost, client_properties, type,
+                              connected_at]).
 
 %%---------------------------------------------------------------------------
 
@@ -72,6 +74,9 @@ handle_message({force_event_refresh, Ref}, State = #state{node = Node}) ->
     {ok, State};
 handle_message(closing_timeout, State = #state{closing_reason = Reason}) ->
     {stop, {closing_timeout, Reason}, State};
+handle_message({'DOWN', _MRef, process, _ConnSup, Reason},
+               State = #state{node = _Node}) ->
+    {stop, {remote_node_down, Reason}, State};
 handle_message(Msg, State) ->
     {stop, {unexpected_msg, Msg}, State}.
 
@@ -94,6 +99,7 @@ i(user,              #state{params = P}) -> P#amqp_params_direct.username;
 i(vhost,             #state{params = P}) -> P#amqp_params_direct.virtual_host;
 i(client_properties, #state{params = P}) ->
     P#amqp_params_direct.client_properties;
+i(connected_at,      #state{connected_at = T}) -> T;
 %% Optional adapter info
 i(protocol,     #state{adapter_info = I}) -> I#amqp_adapter_info.protocol;
 i(host,         #state{adapter_info = I}) -> I#amqp_adapter_info.host;
@@ -122,7 +128,8 @@ connect(Params = #amqp_params_direct{username     = Username,
     State1 = State#state{node         = Node,
                          vhost        = VHost,
                          params       = Params,
-                         adapter_info = ensure_adapter_info(Info)},
+                         adapter_info = ensure_adapter_info(Info),
+                         connected_at = rabbit_misc:now_to_ms(os:timestamp())},
     case rpc:call(Node, rabbit_direct, connect,
                   [{Username, Password}, VHost, ?PROTOCOL, self(),
                    connection_info(State1)]) of
@@ -130,6 +137,13 @@ connect(Params = #amqp_params_direct{username     = Username,
             {ok, ChMgr, Collector} = SIF(i(name, State1)),
             State2 = State1#state{user      = User,
                                   collector = Collector},
+            %% There's no real connection-level process on the remote
+            %% node for us to monitor or link to, but we want to
+            %% detect connection death if the remote node goes down
+            %% when there are no channels. So we monitor the
+            %% supervisor; that way we find out if the node goes down
+            %% or the rabbit app stops.
+            erlang:monitor(process, {rabbit_direct_client_sup, Node}),
             {ok, {ServerProperties, 0, ChMgr, State2}};
         {error, _} = E ->
             E;

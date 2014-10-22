@@ -31,7 +31,7 @@
 
 -behaviour(gen_server2).
 
--export([start_link/3, call_consumer/2, call_consumer/3]).
+-export([start_link/3, call_consumer/2, call_consumer/3, call_consumer/4]).
 -export([behaviour_info/1]).
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2, prioritise_info/3]).
@@ -70,6 +70,9 @@ call_consumer(Pid, Msg) ->
 %% methods and deliveries to the consumer module.
 call_consumer(Pid, Method, Args) ->
     gen_server2:call(Pid, {consumer_call, Method, Args}, infinity).
+
+call_consumer(Pid, Method, Args, DeliveryCtx) ->
+    gen_server2:call(Pid, {consumer_call, Method, Args, DeliveryCtx}, infinity).
 
 %%---------------------------------------------------------------------------
 %% Behaviour
@@ -149,6 +152,19 @@ behaviour_info(callbacks) ->
      %% is received from the server.
      {handle_deliver, 3},
 
+     %% handle_deliver(Deliver, Message,
+     %%                DeliveryCtx, State) -> ok_error()
+     %% where
+     %%      Deliver = #'basic.deliver'{}
+     %%      Message = #amqp_msg{}
+     %%      DeliveryCtx = {pid(), pid(), pid()}
+     %%      State = state()
+     %%
+     %% This callback is invoked by the channel every time a basic.deliver
+     %% is received from the server. Only relevant for channels that use
+     %% direct client connection and manual flow control.
+     {handle_deliver, 4},
+
      %% handle_info(Info, State) -> ok_error()
      %% where
      %%      Info = any()
@@ -207,6 +223,15 @@ init([ConsumerModule, ExtraParams, Identity]) ->
 prioritise_info({'DOWN', _MRef, process, _Pid, _Info}, _Len, _State) -> 1;
 prioritise_info(_, _Len, _State)                                     -> 0.
 
+consumer_call_reply(Return, State) ->
+    case Return of
+        {ok, NewMState} ->
+            {reply, ok, State#state{module_state = NewMState}};
+        {error, Reason, NewMState} ->
+            {stop, {error, Reason}, {error, Reason},
+             State#state{module_state = NewMState}}
+    end.
+
 handle_call({consumer_call, Msg}, From,
             State = #state{module       = ConsumerModule,
                            module_state = MState}) ->
@@ -240,13 +265,14 @@ handle_call({consumer_call, Method, Args}, _From,
             #'basic.deliver'{} ->
                 ConsumerModule:handle_deliver(Method, Args, MState)
         end,
-    case Return of
-        {ok, NewMState} ->
-            {reply, ok, State#state{module_state = NewMState}};
-        {error, Reason, NewMState} ->
-            {stop, {error, Reason}, {error, Reason},
-             State#state{module_state = NewMState}}
-    end.
+    consumer_call_reply(Return, State);
+
+%% only supposed to be used with basic.deliver
+handle_call({consumer_call, Method = #'basic.deliver'{}, Args, DeliveryCtx}, _From,
+            State = #state{module       = ConsumerModule,
+                           module_state = MState}) ->
+    Return = ConsumerModule:handle_deliver(Method, Args, DeliveryCtx, MState),
+    consumer_call_reply(Return, State).
 
 handle_cast(_What, State) ->
     {noreply, State}.
