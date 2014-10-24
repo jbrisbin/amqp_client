@@ -2,3 +2,4 @@
 ebin
 deps
 .rebar
+.erlang.*
