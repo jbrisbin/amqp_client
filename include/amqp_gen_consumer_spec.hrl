@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2011-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2011-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -include("amqp_client.hrl").
@@ -32,6 +32,7 @@
 -spec(handle_consume_ok/3 :: (consume_ok(), consume(), state()) ->
                                   ok_error()).
 -spec(handle_cancel/2 :: (cancel(), state()) -> ok_error()).
+-spec(handle_server_cancel/2 :: (cancel(), state()) -> ok_error()).
 -spec(handle_cancel_ok/3 :: (cancel_ok(), cancel(), state()) -> ok_error()).
 -spec(handle_deliver/3 :: (deliver(), #amqp_msg{}, state()) -> ok_error()).
 -spec(handle_info/2 :: (any(), state()) -> ok_error()).

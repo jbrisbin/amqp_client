@@ -5,7 +5,7 @@ This is a fork of the [official RabbitMQ/AMQP Erlang client](https://github.com/
 It's meant to be included in your rebar projects in your rebar.config file:
 
 		{deps, [
-			{amqp_client, ".*", {git, "git://github.com/jbrisbin/amqp_client.git", {tag, "rabbitmq-2.8.2"}}}
+			{amqp_client, ".*", {git, "git://github.com/jbrisbin/amqp_client.git", {tag, "rabbitmq-3.4.0"}}}
 		]}.
 
 The "master" branch of this port is a simple re-packaging of the rabbit_common AMQP client dependency.
@@ -16,7 +16,7 @@ To use the "community" branch in your project, which includes stricter compilati
 to the version tag:
 
 		{deps, [
-			{amqp_client, ".*", {git, "git://github.com/jbrisbin/amqp_client.git", {tag, "rabbitmq-2.8.2-community"}}}
+			{amqp_client, ".*", {git, "git://github.com/jbrisbin/amqp_client.git", {tag, "rabbitmq-3.4.0-community"}}}
 		]}.
 
 ### License 

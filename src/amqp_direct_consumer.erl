@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2011-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2011-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @doc This module is an implementation of the amqp_gen_consumer
@@ -45,8 +45,9 @@
 -behaviour(amqp_gen_consumer).
 
 -export([init/1, handle_consume_ok/3, handle_consume/3, handle_cancel_ok/3,
-         handle_cancel/2, handle_deliver/3, handle_info/2, handle_call/3,
-         terminate/2]).
+         handle_cancel/2, handle_server_cancel/2,
+         handle_deliver/3, handle_deliver/4,
+         handle_info/2, handle_call/3, terminate/2]).
 
 %%---------------------------------------------------------------------------
 %% amqp_gen_consumer callbacks
@@ -78,9 +79,18 @@ handle_cancel_ok(M, _, C) ->
     {ok, C}.
 
 %% @private
+handle_server_cancel(M, C) ->
+    C ! {server_cancel, M},
+    {ok, C}.
+
+%% @private
 handle_deliver(M, A, C) ->
     C ! {M, A},
     {ok, C}.
+handle_deliver(M, A, DeliveryCtx, C) ->
+    C ! {M, A, DeliveryCtx},
+    {ok, C}.
+
 
 %% @private
 handle_info({'DOWN', _MRef, process, C, Info}, C) ->

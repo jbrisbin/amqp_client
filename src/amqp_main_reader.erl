@@ -10,18 +10,18 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @private
 -module(amqp_main_reader).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
 -behaviour(gen_server).
 
--export([start_link/4]).
+-export([start_link/5]).
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2]).
 
@@ -36,25 +36,32 @@
 %% Interface
 %%---------------------------------------------------------------------------
 
-start_link(Sock, Connection, ChMgr, AState) ->
-    gen_server:start_link(?MODULE, [Sock, Connection, ChMgr, AState], []).
+start_link(Sock, Connection, ChMgr, AState, ConnName) ->
+    gen_server:start_link(
+      ?MODULE, [Sock, Connection, ConnName, ChMgr, AState], []).
 
 %%---------------------------------------------------------------------------
 %% gen_server callbacks
 %%---------------------------------------------------------------------------
 
-init([Sock, Connection, ChMgr, AState]) ->
-    case next(7, #state{sock = Sock, connection = Connection,
-                        channels_manager = ChMgr, astate = AState}) of
-        {noreply, State}       -> {ok, State};
-        {stop, Reason, _State} -> {stop, Reason}
+init([Sock, Connection, ConnName, ChMgr, AState]) ->
+    ?store_proc_name(ConnName),
+    State = #state{sock             = Sock,
+                   connection       = Connection,
+                   channels_manager = ChMgr,
+                   astate           = AState,
+                   message          = none},
+    case rabbit_net:async_recv(Sock, 0, infinity) of
+        {ok, _}         -> {ok, State};
+        {error, Reason} -> {stop, Reason, _} = handle_error(Reason, State),
+                           {stop, Reason}
     end.
 
 terminate(_Reason, _State) ->
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
-    State.
+    {ok, State}.
 
 handle_call(Call, From, State) ->
     {stop, {unexpected_call, Call, From}, State}.
@@ -62,16 +69,53 @@ handle_call(Call, From, State) ->
 handle_cast(Cast, State) ->
     {stop, {unexpected_cast, Cast}, State}.
 
-handle_info({inet_async, Sock, _, {ok, <<Type:8, Channel:16, Length:32>>}},
-            State = #state{sock = Sock, message = none}) ->
-    next(Length + 1, State#state{message = {Type, Channel, Length}});
 handle_info({inet_async, Sock, _, {ok, Data}},
-            State = #state{sock = Sock, message = {Type, Channel, L}}) ->
-    <<Payload:L/binary, ?FRAME_END>> = Data,
-    next(7, process_frame(Type, Channel, Payload, State#state{message = none}));
+            State = #state {sock = Sock}) ->
+    %% Latency hiding: Request next packet first, then process data
+    case rabbit_net:async_recv(Sock, 0, infinity) of
+         {ok, _}         -> handle_data(Data, State);
+         {error, Reason} -> handle_error(Reason, State)
+    end;
 handle_info({inet_async, Sock, _, {error, Reason}},
             State = #state{sock = Sock}) ->
     handle_error(Reason, State).
+
+handle_data(<<Type:8, Channel:16, Length:32, Payload:Length/binary, ?FRAME_END,
+              More/binary>>,
+            #state{message = none} = State) when
+      Type =:= ?FRAME_METHOD; Type =:= ?FRAME_HEADER;
+      Type =:= ?FRAME_BODY;   Type =:= ?FRAME_HEARTBEAT ->
+    %% Optimisation for the direct match
+    handle_data(
+      More, process_frame(Type, Channel, Payload, State#state{message = none}));
+handle_data(<<Type:8, Channel:16, Length:32, Data/binary>>,
+            #state{message = none} = State) when
+      Type =:= ?FRAME_METHOD; Type =:= ?FRAME_HEADER;
+      Type =:= ?FRAME_BODY;   Type =:= ?FRAME_HEARTBEAT ->
+    {noreply, State#state{message = {Type, Channel, Length, Data}}};
+handle_data(<<"AMQP", A, B, C>>, #state{sock = Sock, message = none} = State) ->
+    {ok, <<D>>} = rabbit_net:sync_recv(Sock, 1),
+    handle_error({refused, {A, B, C, D}}, State);
+handle_data(<<Malformed:7/binary, _Rest/binary>>,
+            #state{message = none} = State) ->
+    handle_error({malformed_header, Malformed}, State);
+handle_data(<<Data/binary>>, #state{message = none} = State) ->
+    {noreply, State#state{message = {expecting_header, Data}}};
+handle_data(Data, #state{message = {Type, Channel, L, OldData}} = State) ->
+    case <<OldData/binary, Data/binary>> of
+        <<Payload:L/binary, ?FRAME_END, More/binary>> ->
+            handle_data(More,
+                        process_frame(Type, Channel, Payload,
+                                            State#state{message = none}));
+        NotEnough ->
+            %% Read in more data from the socket
+            {noreply, State#state{message = {Type, Channel, L, NotEnough}}}
+    end;
+handle_data(Data,
+            #state{message = {expecting_header, Old}} = State) ->
+    handle_data(<<Old/binary, Data/binary>>, State#state{message = none});
+handle_data(<<>>, State) ->
+    {noreply, State}.
 
 %%---------------------------------------------------------------------------
 %% Internal plumbing
@@ -99,14 +143,14 @@ process_frame(Type, ChNumber, Payload,
                                    AnalyzedFrame, 0, Connection, AState)}
     end.
 
-next(Length, State = #state{sock = Sock}) ->
-     case rabbit_net:async_recv(Sock, Length, infinity) of
-         {ok, _}         -> {noreply, State};
-         {error, Reason} -> handle_error(Reason, State)
-     end.
-
 handle_error(closed, State = #state{connection = Conn}) ->
     Conn ! socket_closed,
+    {noreply, State};
+handle_error({refused, Version},  State = #state{connection = Conn}) ->
+    Conn ! {refused, Version},
+    {noreply, State};
+handle_error({malformed_header, Version},  State = #state{connection = Conn}) ->
+    Conn ! {malformed_header, Version},
     {noreply, State};
 handle_error(Reason, State = #state{connection = Conn}) ->
     Conn ! {socket_error, Reason},

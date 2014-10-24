@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2011-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2011-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @doc A behaviour module for implementing consumers for
@@ -31,10 +31,10 @@
 
 -behaviour(gen_server2).
 
--export([start_link/2, call_consumer/2, call_consumer/3]).
+-export([start_link/3, call_consumer/2, call_consumer/3, call_consumer/4]).
 -export([behaviour_info/1]).
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
-         handle_info/2, prioritise_info/2]).
+         handle_info/2, prioritise_info/3]).
 
 -record(state, {module,
                 module_state}).
@@ -46,8 +46,9 @@
 %% @type ok_error() = {ok, state()} | {error, reason(), state()}.
 %% Denotes a successful or an error return from a consumer module call.
 
-start_link(ConsumerModule, ExtraParams) ->
-    gen_server2:start_link(?MODULE, [ConsumerModule, ExtraParams], []).
+start_link(ConsumerModule, ExtraParams, Identity) ->
+    gen_server2:start_link(
+      ?MODULE, [ConsumerModule, ExtraParams, Identity], []).
 
 %% @spec (Consumer, Msg) -> ok
 %% where
@@ -69,6 +70,9 @@ call_consumer(Pid, Msg) ->
 %% methods and deliveries to the consumer module.
 call_consumer(Pid, Method, Args) ->
     gen_server2:call(Pid, {consumer_call, Method, Args}, infinity).
+
+call_consumer(Pid, Method, Args, DeliveryCtx) ->
+    gen_server2:call(Pid, {consumer_call, Method, Args, DeliveryCtx}, infinity).
 
 %%---------------------------------------------------------------------------
 %% Behaviour
@@ -116,7 +120,7 @@ behaviour_info(callbacks) ->
      %%      State = state()
      %%
      %% This callback is invoked by the channel every time a basic.cancel
-     %% is received from the server.
+     %% is sent to the server.
      {handle_cancel, 2},
 
      %% handle_cancel_ok(CancelOk, Cancel, State) -> ok_error()
@@ -129,6 +133,15 @@ behaviour_info(callbacks) ->
      %% is received from the server.
      {handle_cancel_ok, 3},
 
+     %% handle_server_cancel(Cancel, State) -> ok_error()
+     %% where
+     %%      Cancel = #'basic.cancel'{}
+     %%      State = state()
+     %%
+     %% This callback is invoked by the channel every time a basic.cancel
+     %% is received from the server.
+     {handle_server_cancel, 2},
+
      %% handle_deliver(Deliver, Message, State) -> ok_error()
      %% where
      %%      Deliver = #'basic.deliver'{}
@@ -138,6 +151,19 @@ behaviour_info(callbacks) ->
      %% This callback is invoked by the channel every time a basic.deliver
      %% is received from the server.
      {handle_deliver, 3},
+
+     %% handle_deliver(Deliver, Message,
+     %%                DeliveryCtx, State) -> ok_error()
+     %% where
+     %%      Deliver = #'basic.deliver'{}
+     %%      Message = #amqp_msg{}
+     %%      DeliveryCtx = {pid(), pid(), pid()}
+     %%      State = state()
+     %%
+     %% This callback is invoked by the channel every time a basic.deliver
+     %% is received from the server. Only relevant for channels that use
+     %% direct client connection and manual flow control.
+     {handle_deliver, 4},
 
      %% handle_info(Info, State) -> ok_error()
      %% where
@@ -183,7 +209,8 @@ behaviour_info(_Other) ->
 %% gen_server2 callbacks
 %%---------------------------------------------------------------------------
 
-init([ConsumerModule, ExtraParams]) ->
+init([ConsumerModule, ExtraParams, Identity]) ->
+    ?store_proc_name(Identity),
     case ConsumerModule:init(ExtraParams) of
         {ok, MState} ->
             {ok, #state{module = ConsumerModule, module_state = MState}};
@@ -193,8 +220,17 @@ init([ConsumerModule, ExtraParams]) ->
             ignore
     end.
 
-prioritise_info({'DOWN', _MRef, process, _Pid, _Info}, _State) -> 1;
-prioritise_info(_, _State)                                     -> 0.
+prioritise_info({'DOWN', _MRef, process, _Pid, _Info}, _Len, _State) -> 1;
+prioritise_info(_, _Len, _State)                                     -> 0.
+
+consumer_call_reply(Return, State) ->
+    case Return of
+        {ok, NewMState} ->
+            {reply, ok, State#state{module_state = NewMState}};
+        {error, Reason, NewMState} ->
+            {stop, {error, Reason}, {error, Reason},
+             State#state{module_state = NewMState}}
+    end.
 
 handle_call({consumer_call, Msg}, From,
             State = #state{module       = ConsumerModule,
@@ -218,19 +254,25 @@ handle_call({consumer_call, Method, Args}, _From,
             #'basic.consume_ok'{} ->
                 ConsumerModule:handle_consume_ok(Method, Args, MState);
             #'basic.cancel'{} ->
-                ConsumerModule:handle_cancel(Method, MState);
+                case Args of
+                    none -> %% server-sent
+                        ConsumerModule:handle_server_cancel(Method, MState);
+                    Pid when is_pid(Pid) -> %% client-sent
+                        ConsumerModule:handle_cancel(Method, MState)
+                end;
             #'basic.cancel_ok'{} ->
                 ConsumerModule:handle_cancel_ok(Method, Args, MState);
             #'basic.deliver'{} ->
                 ConsumerModule:handle_deliver(Method, Args, MState)
         end,
-    case Return of
-        {ok, NewMState} ->
-            {reply, ok, State#state{module_state = NewMState}};
-        {error, Reason, NewMState} ->
-            {stop, {error, Reason}, {error, Reason},
-             State#state{module_state = NewMState}}
-    end.
+    consumer_call_reply(Return, State);
+
+%% only supposed to be used with basic.deliver
+handle_call({consumer_call, Method = #'basic.deliver'{}, Args, DeliveryCtx}, _From,
+            State = #state{module       = ConsumerModule,
+                           module_state = MState}) ->
+    Return = ConsumerModule:handle_deliver(Method, Args, DeliveryCtx, MState),
+    consumer_call_reply(Return, State).
 
 handle_cast(_What, State) ->
     {noreply, State}.
@@ -241,12 +283,11 @@ handle_info(Info, State = #state{module_state = MState,
         {ok, NewMState} ->
             {noreply, State#state{module_state = NewMState}};
         {error, Reason, NewMState} ->
-            {stop, {error, Reason}, {error, Reason},
-             State#state{module_state = NewMState}}
+            {stop, {error, Reason}, State#state{module_state = NewMState}}
     end.
 
 terminate(Reason, #state{module = ConsumerModule, module_state = MState}) ->
     ConsumerModule:terminate(Reason, MState).
 
 code_change(_OldVsn, State, _Extra) ->
-    State.
+    {ok, State}.
