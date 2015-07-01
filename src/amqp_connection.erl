@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @type close_reason(Type) = {shutdown, amqp_reason(Type)}.
@@ -67,27 +67,33 @@
 %% See type definitions below.
 -module(amqp_connection).
 
--include("amqp_client.hrl").
+-include("amqp_client_internal.hrl").
 
--export([open_channel/1, open_channel/2, open_channel/3]).
--export([start/1]).
--export([close/1, close/3]).
+-export([open_channel/1, open_channel/2, open_channel/3, register_blocked_handler/2]).
+-export([start/1, close/1, close/2, close/3]).
+-export([error_atom/1]).
 -export([info/2, info_keys/1, info_keys/0]).
+-export([socket_adapter_info/2]).
+
+-define(DEFAULT_CONSUMER, {amqp_selective_consumer, []}).
+
+-define(PROTOCOL_SSL_PORT, (?PROTOCOL_PORT - 1)).
 
 %%---------------------------------------------------------------------------
 %% Type Definitions
 %%---------------------------------------------------------------------------
 
-%% @type adapter_info() = #adapter_info{}.
+%% @type amqp_adapter_info() = #amqp_adapter_info{}.
 %% @type amqp_params_direct() = #amqp_params_direct{}.
 %% As defined in amqp_client.hrl. It contains the following fields:
 %% <ul>
 %% <li>username :: binary() - The name of a user registered with the broker,
 %%     defaults to &lt;&lt;guest"&gt;&gt;</li>
+%% <li>password :: binary() - The password of user, defaults to 'none'</li>
 %% <li>virtual_host :: binary() - The name of a virtual host in the broker,
 %%     defaults to &lt;&lt;"/"&gt;&gt;</li>
 %% <li>node :: atom() - The node the broker runs on (direct only)</li>
-%% <li>adapter_info :: adapter_info() - Extra management information for if
+%% <li>adapter_info :: amqp_adapter_info() - Extra management information for if
 %%     this connection represents a non-AMQP network connection.</li>
 %% <li>client_properties :: [{binary(), atom(), binary()}] - A list of extra
 %%     client properties to be sent to the server, defaults to []</li>
@@ -142,11 +148,7 @@
 %% the default ports will be selected depending on whether this is a
 %% normal or an SSL connection.
 start(AmqpParams) ->
-    case amqp_client:start() of
-        ok                                      -> ok;
-        {error, {already_started, amqp_client}} -> ok;
-        {error, _} = E                          -> throw(E)
-    end,
+    ensure_started(),
     AmqpParams1 =
         case AmqpParams of
             #amqp_params_network{port = undefined, ssl_options = none} ->
@@ -159,13 +161,33 @@ start(AmqpParams) ->
     {ok, _Sup, Connection} = amqp_sup:start_connection_sup(AmqpParams1),
     amqp_gen_connection:connect(Connection).
 
+%% Usually the amqp_client application will already be running. We
+%% check whether that is the case by invoking an undocumented function
+%% which does not require a synchronous call to the application
+%% controller. That way we don't risk a dead-lock if, say, the
+%% application controller is in the process of shutting down the very
+%% application which is making this call.
+ensure_started() ->
+    [ensure_started(App) || App <- [xmerl, amqp_client]].
+
+ensure_started(App) ->
+    case application_controller:get_master(App) of
+        undefined -> case application:start(App) of
+                         ok                              -> ok;
+                         {error, {already_started, App}} -> ok;
+                         {error, _} = E                  -> throw(E)
+                     end;
+        _         -> ok
+    end.
+
 %%---------------------------------------------------------------------------
 %% Commands
 %%---------------------------------------------------------------------------
 
-%% @doc Invokes open_channel(ConnectionPid, none, ?DEFAULT_CONSUMER).
-%% Opens a channel without having to specify a channel number. This uses the
-%% default consumer implementation.
+%% @doc Invokes open_channel(ConnectionPid, none,
+%% {amqp_selective_consumer, []}).  Opens a channel without having to
+%% specify a channel number. This uses the default consumer
+%% implementation.
 open_channel(ConnectionPid) ->
     open_channel(ConnectionPid, none, ?DEFAULT_CONSUMER).
 
@@ -174,8 +196,9 @@ open_channel(ConnectionPid) ->
 open_channel(ConnectionPid, {_, _} = Consumer) ->
     open_channel(ConnectionPid, none, Consumer);
 
-%% @doc Invokes open_channel(ConnectionPid, ChannelNumber, ?DEFAULT_CONSUMER).
-%% Opens a channel, using the default consumer implementation.
+%% @doc Invokes open_channel(ConnectionPid, ChannelNumber,
+%% {amqp_selective_consumer, []}).  Opens a channel, using the default
+%% consumer implementation.
 open_channel(ConnectionPid, ChannelNumber)
         when is_number(ChannelNumber) orelse ChannelNumber =:= none ->
     open_channel(ConnectionPid, ChannelNumber, ?DEFAULT_CONSUMER).
@@ -196,9 +219,9 @@ open_channel(ConnectionPid, ChannelNumber)
 %% is passed as parameter to ConsumerModule:init/1.<br/>
 %% This function assumes that an AMQP connection (networked or direct)
 %% has already been successfully established.<br/>
-%% ChannelNumber must be less than or equal to the negotiated max_channel value,
-%% or less than or equal to ?MAX_CHANNEL_NUMBER if the negotiated max_channel
-%% value is 0.<br/>
+%% ChannelNumber must be less than or equal to the negotiated
+%% max_channel value, or less than or equal to ?MAX_CHANNEL_NUMBER
+%% (65535) if the negotiated max_channel value is 0.<br/>
 %% In the direct connection, max_channel is always 0.
 open_channel(ConnectionPid, ChannelNumber,
              {_ConsumerModule, _ConsumerArgs} = Consumer) ->
@@ -212,6 +235,14 @@ open_channel(ConnectionPid, ChannelNumber,
 close(ConnectionPid) ->
     close(ConnectionPid, 200, <<"Goodbye">>).
 
+%% @spec (ConnectionPid, Timeout) -> ok | Error
+%% where
+%%      ConnectionPid = pid()
+%%      Timeout = integer()
+%% @doc Closes the channel, using the supplied Timeout value.
+close(ConnectionPid, Timeout) ->
+    close(ConnectionPid, 200, <<"Goodbye">>, Timeout).
+
 %% @spec (ConnectionPid, Code, Text) -> ok | closing
 %% where
 %%      ConnectionPid = pid()
@@ -220,15 +251,37 @@ close(ConnectionPid) ->
 %% @doc Closes the AMQP connection, allowing the caller to set the reply
 %% code and text.
 close(ConnectionPid, Code, Text) ->
-    Close = #'connection.close'{reply_text =  Text,
+    close(ConnectionPid, Code, Text, infinity).
+
+%% @spec (ConnectionPid, Code, Text, Timeout) -> ok | closing
+%% where
+%%      ConnectionPid = pid()
+%%      Code = integer()
+%%      Text = binary()
+%%      Timeout = integer()
+%% @doc Closes the AMQP connection, allowing the caller to set the reply
+%% code and text, as well as a timeout for the operation, after which the
+%% connection will be abruptly terminated.
+close(ConnectionPid, Code, Text, Timeout) ->
+    Close = #'connection.close'{reply_text = Text,
                                 reply_code = Code,
                                 class_id   = 0,
                                 method_id  = 0},
-    amqp_gen_connection:close(ConnectionPid, Close).
+    amqp_gen_connection:close(ConnectionPid, Close, Timeout).
+
+register_blocked_handler(ConnectionPid, BlockHandler) ->
+    amqp_gen_connection:register_blocked_handler(ConnectionPid, BlockHandler).
 
 %%---------------------------------------------------------------------------
 %% Other functions
 %%---------------------------------------------------------------------------
+
+%% @spec (Code) -> atom()
+%% where
+%%      Code = integer()
+%% @doc Returns a descriptive atom corresponding to the given AMQP
+%% error code.
+error_atom(Code) -> ?PROTOCOL:amqp_exception(Code).
 
 %% @spec (ConnectionPid, Items) -> ResultList
 %% where
@@ -284,3 +337,8 @@ info_keys(ConnectionPid) ->
 %% atoms that can be used for a certain connection, use info_keys/1.
 info_keys() ->
     amqp_gen_connection:info_keys().
+
+%% @doc Takes a socket and a protocol, returns an #amqp_adapter_info{}
+%% based on the socket for the protocol given.
+socket_adapter_info(Sock, Protocol) ->
+    amqp_direct_connection:socket_adapter_info(Sock, Protocol).

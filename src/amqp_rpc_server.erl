@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @doc This is a utility module that is used to expose an arbitrary function
@@ -27,7 +27,7 @@
 
 -export([init/1, terminate/2, code_change/3, handle_call/3,
          handle_cast/2, handle_info/2]).
--export([start/3]).
+-export([start/3, start_link/3]).
 -export([stop/1]).
 
 -record(state, {channel,
@@ -49,6 +49,20 @@
 %% server.
 start(Connection, Queue, Fun) ->
     {ok, Pid} = gen_server:start(?MODULE, [Connection, Queue, Fun], []),
+    Pid.
+
+%% @spec (Connection, Queue, RpcHandler) -> RpcServer
+%% where
+%%      Connection = pid()
+%%      Queue = binary()
+%%      RpcHandler = function()
+%%      RpcServer = pid()
+%% @doc Starts, and links to, a new RPC server instance that receives
+%% requests via a specified queue and dispatches them to a specified
+%% handler function. This function returns the pid of the RPC server that
+%% can be used to stop the server.
+start_link(Connection, Queue, Fun) ->
+    {ok, Pid} = gen_server:start_link(?MODULE, [Connection, Queue, Fun], []),
     Pid.
 
 %% @spec (RpcServer) -> ok
@@ -130,4 +144,4 @@ terminate(_Reason, #state{channel = Channel}) ->
 
 %% @private
 code_change(_OldVsn, State, _Extra) ->
-    State.
+    {ok, State}.

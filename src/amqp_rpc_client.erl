@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2007-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @doc This module allows the simple execution of an asynchronous RPC over
@@ -25,7 +25,7 @@
 
 -behaviour(gen_server).
 
--export([start/2, stop/1]).
+-export([start/2, start_link/2, stop/1]).
 -export([call/2]).
 -export([init/1, terminate/2, code_change/3, handle_call/3,
          handle_cast/2, handle_info/2]).
@@ -53,6 +53,18 @@ start(Connection, Queue) ->
     {ok, Pid} = gen_server:start(?MODULE, [Connection, Queue], []),
     Pid.
 
+%% @spec (Connection, Queue) -> RpcClient
+%% where
+%%      Connection = pid()
+%%      Queue = binary()
+%%      RpcClient = pid()
+%% @doc Starts, and links to, a new RPC client instance that sends requests
+%% to a specified queue. This function returns the pid of the RPC client
+%% process that can be used to invoke RPCs and stop the client.
+start_link(Connection, Queue) ->
+    {ok, Pid} = gen_server:start_link(?MODULE, [Connection, Queue], []),
+    Pid.
+
 %% @spec (RpcClient) -> ok
 %% where
 %%      RpcClient = pid()
@@ -76,7 +88,8 @@ call(RpcClient, Payload) ->
 %% Sets up a reply queue for this client to listen on
 setup_reply_queue(State = #state{channel = Channel}) ->
     #'queue.declare_ok'{queue = Q} =
-        amqp_channel:call(Channel, #'queue.declare'{}),
+        amqp_channel:call(Channel, #'queue.declare'{exclusive   = true,
+                                                    auto_delete = true}),
     State#state{reply_queue = Q}.
 
 %% Registers this RPC client instance as a consumer to handle rpc responses
@@ -93,7 +106,8 @@ publish(Payload, From,
                        routing_key = RoutingKey,
                        correlation_id = CorrelationId,
                        continuations = Continuations}) ->
-    Props = #'P_basic'{correlation_id = <<CorrelationId:64>>,
+    EncodedCorrelationId = base64:encode(<<CorrelationId:64>>),
+    Props = #'P_basic'{correlation_id = EncodedCorrelationId,
                        content_type = <<"application/octet-stream">>,
                        reply_to = Q},
     Publish = #'basic.publish'{exchange = X,
@@ -102,7 +116,7 @@ publish(Payload, From,
     amqp_channel:call(Channel, Publish, #amqp_msg{props = Props,
                                                   payload = Payload}),
     State#state{correlation_id = CorrelationId + 1,
-                continuations = dict:store(CorrelationId, From, Continuations)}.
+                continuations = dict:store(EncodedCorrelationId, From, Continuations)}.
 
 %%--------------------------------------------------------------------------
 %% gen_server callbacks
@@ -158,7 +172,7 @@ handle_info(#'basic.cancel_ok'{}, State) ->
 
 %% @private
 handle_info({#'basic.deliver'{delivery_tag = DeliveryTag},
-             #amqp_msg{props = #'P_basic'{correlation_id = <<Id:64>>},
+             #amqp_msg{props = #'P_basic'{correlation_id = Id},
                        payload = Payload}},
             State = #state{continuations = Conts, channel = Channel}) ->
     From = dict:fetch(Id, Conts),
@@ -168,4 +182,4 @@ handle_info({#'basic.deliver'{delivery_tag = DeliveryTag},
 
 %% @private
 code_change(_OldVsn, State, _Extra) ->
-    State.
+    {ok, State}.

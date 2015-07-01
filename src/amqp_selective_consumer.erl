@@ -10,8 +10,8 @@
 %%
 %% The Original Code is RabbitMQ.
 %%
-%% The Initial Developer of the Original Code is VMware, Inc.
-%% Copyright (c) 2011-2012 VMware, Inc.  All rights reserved.
+%% The Initial Developer of the Original Code is GoPivotal, Inc.
+%% Copyright (c) 2011-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 %% @doc This module is an implementation of the amqp_gen_consumer
@@ -45,8 +45,9 @@
 
 -export([register_default_consumer/2]).
 -export([init/1, handle_consume_ok/3, handle_consume/3, handle_cancel_ok/3,
-         handle_cancel/2, handle_deliver/3, handle_info/2, handle_call/3,
-         terminate/2]).
+         handle_cancel/2, handle_server_cancel/2,
+         handle_deliver/3, handle_deliver/4,
+         handle_info/2, handle_call/3, terminate/2]).
 
 -record(state, {consumers             = dict:new(), %% Tag -> ConsumerPid
                 unassigned            = undefined,  %% Pid
@@ -80,32 +81,31 @@ init([]) ->
     {ok, #state{}}.
 
 %% @private
-handle_consume(BasicConsume, Pid, State = #state{consumers = Consumers,
-                                                 monitors = Monitors}) ->
-    Tag = tag(BasicConsume),
-    Ok =
-        case BasicConsume of
-            #'basic.consume'{nowait = true}
-                    when Tag =:= undefined orelse size(Tag) == 0 ->
-                false; %% Async and undefined tag
-            _ when is_binary(Tag) andalso size(Tag) >= 0 ->
-                case resolve_consumer(Tag, State) of
-                    {consumer, _} -> false; %% Tag already in use
-                    _             -> true
-                end;
-           _ ->
-               true
-        end,
-    case {Ok, BasicConsume} of
-        {true, #'basic.consume'{nowait = true}} ->
+handle_consume(#'basic.consume'{consumer_tag = Tag,
+                                nowait       = NoWait},
+               Pid, State = #state{consumers = Consumers,
+                                   monitors = Monitors}) ->
+    Result = case NoWait of
+                 true when Tag =:= undefined orelse size(Tag) == 0 ->
+                     no_consumer_tag_specified;
+                 _ when is_binary(Tag) andalso size(Tag) >= 0 ->
+                     case resolve_consumer(Tag, State) of
+                         {consumer, _} -> consumer_tag_in_use;
+                         _             -> ok
+                     end;
+                 _ ->
+                     ok
+             end,
+    case {Result, NoWait} of
+        {ok, true} ->
             {ok, State#state
-             {consumers = dict:store(Tag, Pid, Consumers),
-              monitors  = add_to_monitor_dict(Pid, Monitors)}};
-        {true, #'basic.consume'{nowait = false}} ->
+                   {consumers = dict:store(Tag, Pid, Consumers),
+                    monitors  = add_to_monitor_dict(Pid, Monitors)}};
+        {ok, false} ->
             {ok, State#state{unassigned = Pid}};
-        {false, #'basic.consume'{nowait = true}} ->
-            {error, 'no_consumer_tag_specified', State};
-        {false, #'basic.consume'{nowait = false}} ->
+        {Err, true} ->
+            {error, Err, State};
+        {_Err, false} ->
             %% Don't do anything (don't override existing
             %% consumers), the server will close the channel with an error.
             {ok, State}
@@ -126,11 +126,16 @@ handle_consume_ok(BasicConsumeOk, _BasicConsume,
     {ok, State1}.
 
 %% @private
-%% The server sent a basic.cancel.
-handle_cancel(Cancel, State) ->
-    State1 = do_cancel(Cancel, State),
-    %% Use old state
-    deliver(Cancel, State),
+%% We sent a basic.cancel.
+handle_cancel(#'basic.cancel'{nowait = true},
+              #state{default_consumer = none}) ->
+    exit(cancel_nowait_requires_default_consumer);
+
+handle_cancel(Cancel = #'basic.cancel'{nowait = NoWait}, State) ->
+    State1 = case NoWait of
+                 true  -> do_cancel(Cancel, State);
+                 false -> State
+             end,
     {ok, State1}.
 
 %% @private
@@ -142,8 +147,21 @@ handle_cancel_ok(CancelOk, _Cancel, State) ->
     {ok, State1}.
 
 %% @private
-handle_deliver(Deliver, Message, State) ->
-    deliver(Deliver, Message, State),
+%% The server sent a basic.cancel.
+handle_server_cancel(Cancel = #'basic.cancel'{nowait = true}, State) ->
+    State1 = do_cancel(Cancel, State),
+    %% Use old state
+    deliver(Cancel, State),
+    {ok, State1}.
+
+%% @private
+handle_deliver(Method, Message, State) ->
+    deliver(Method, Message, State),
+    {ok, State}.
+
+%% @private
+handle_deliver(Method, Message, DeliveryCtx, State) ->
+    deliver(Method, Message, DeliveryCtx, State),
     {ok, State}.
 
 %% @private
@@ -189,17 +207,25 @@ terminate(_Reason, State) ->
 %% Internal plumbing
 %%---------------------------------------------------------------------------
 
-deliver(Msg, State) ->
-    deliver(Msg, undefined, State).
-deliver(Msg, Message, State) ->
-    Combined = if Message =:= undefined -> Msg;
-                  true                  -> {Msg, Message}
-               end,
-    case resolve_consumer(tag(Msg), State) of
-        {consumer, Pid} -> Pid ! Combined;
-        {default, Pid}  -> Pid ! Combined;
+deliver_to_consumer_or_die(Method, Msg, State) ->
+    case resolve_consumer(tag(Method), State) of
+        {consumer, Pid} -> Pid ! Msg;
+        {default, Pid}  -> Pid ! Msg;
         error           -> exit(unexpected_delivery_and_no_default_consumer)
     end.
+
+deliver(Method, State) ->
+    deliver(Method, undefined, State).
+deliver(Method, Message, State) ->
+    Combined = if Message =:= undefined -> Method;
+                  true                  -> {Method, Message}
+               end,
+    deliver_to_consumer_or_die(Method, Combined, State).
+deliver(Method, Message, DeliveryCtx, State) ->
+    Combined = if Message =:= undefined -> Method;
+                  true                  -> {Method, Message, DeliveryCtx}
+               end,
+    deliver_to_consumer_or_die(Method, Combined, State).
 
 do_cancel(Cancel, State = #state{consumers = Consumers,
                                  monitors  = Monitors}) ->
