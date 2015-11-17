@@ -1,4 +1,4 @@
-# Rebar-friendly fork of Erlang AMQP client
+# Rebar-friendly fork of Erlang AMQP client [![Build Status](https://travis-ci.org/jbrisbin/amqp_client.svg?branch=master)](https://travis-ci.org/jbrisbin/amqp_client)
 
 This is a fork of the [official RabbitMQ/AMQP Erlang client](https://github.com/rabbitmq/rabbitmq-erlang-client).
 
