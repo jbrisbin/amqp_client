@@ -19,6 +19,6 @@ ERLC_OPTS = +debug_info \
 COMPILE_FIRST = amqp_gen_consumer \
                 amqp_gen_connection
 
-dep_rabbit_common = git git://github.com/jbrisbin/rabbit_common.git rabbitmq-3.4.0
+dep_rabbit_common = git git://github.com/jbrisbin/rabbit_common.git rabbitmq-3.5.6
 
 include erlang.mk

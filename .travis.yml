@@ -1,0 +1,14 @@
+language: erlang
+
+sudo: false
+
+otp_release:
+   - R16B03
+   - 17.5
+   - 18.1
+
+script: "make"
+
+notifications:
+  recipients:
+    - jon@jbrisbin.com

@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
+%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
 %%
 
 %% @private
@@ -74,8 +74,9 @@ handle_message({force_event_refresh, Ref}, State = #state{node = Node}) ->
     {ok, State};
 handle_message(closing_timeout, State = #state{closing_reason = Reason}) ->
     {stop, {closing_timeout, Reason}, State};
-handle_message({'DOWN', _MRef, process, _ConnSup, Reason},
-               State = #state{node = _Node}) ->
+handle_message({'DOWN', _MRef, process, _ConnSup, shutdown}, State) ->
+    {stop, {shutdown, node_down}, State};
+handle_message({'DOWN', _MRef, process, _ConnSup, Reason}, State) ->
     {stop, {remote_node_down, Reason}, State};
 handle_message(Msg, State) ->
     {stop, {unexpected_msg, Msg}, State}.
@@ -129,7 +130,8 @@ connect(Params = #amqp_params_direct{username     = Username,
                          vhost        = VHost,
                          params       = Params,
                          adapter_info = ensure_adapter_info(Info),
-                         connected_at = rabbit_misc:now_to_ms(os:timestamp())},
+                         connected_at =
+                           time_compat:os_system_time(milli_seconds)},
     case rpc:call(Node, rabbit_direct, connect,
                   [{Username, Password}, VHost, ?PROTOCOL, self(),
                    connection_info(State1)]) of
