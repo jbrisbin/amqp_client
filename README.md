@@ -16,7 +16,7 @@ To use the "community" branch in your project, which includes stricter compilati
 to the version tag:
 
     {deps, [
-      {amqp_client, ".*", {git, "git://github.com/jbrisbin/amqp_client.git", {tag, "rabbitmq-3.5.0-community"}}}
+      {amqp_client, ".*", {git, "git://github.com/jbrisbin/amqp_client.git", {tag, "rabbitmq-3.5.6-community"}}}
     ]}.
 
 ### License
