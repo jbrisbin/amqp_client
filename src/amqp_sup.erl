@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
 %%
 
 %% @private
@@ -21,7 +21,7 @@
 
 -behaviour(supervisor2).
 
--export([start_link/0, start_connection_sup/1]).
+-export([start_link/0, is_ready/0, start_connection_sup/1]).
 -export([init/1]).
 
 %%---------------------------------------------------------------------------
@@ -30,6 +30,9 @@
 
 start_link() ->
     supervisor2:start_link({local, amqp_sup}, ?MODULE, []).
+
+is_ready() ->
+    whereis(amqp_sup) =/= undefined.
 
 start_connection_sup(AmqpParams) ->
     supervisor2:start_child(amqp_sup, [AmqpParams]).

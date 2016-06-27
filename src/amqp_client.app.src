@@ -1,6 +1,6 @@
 {application, amqp_client,
  [{description, "RabbitMQ AMQP Client"},
-  {vsn, "3.5.6"},
+  {vsn, "3.6.2"},
   {modules, []},
   {registered, [amqp_sup]},
   {env, [{prefer_ipv6, false},
