@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
 %%
 
 %% @private
@@ -60,7 +60,7 @@ start_writer(Sup, network, [Sock, FrameMax], ConnName, ChNumber, ChPid) ->
                      {writer, {rabbit_writer, start_link,
                                [Sock, ChNumber, FrameMax, ?PROTOCOL, ChPid,
                                 {ConnName, ChNumber}]},
-                      intrinsic, ?MAX_WAIT, worker, [rabbit_writer]}),
+                      transient, ?MAX_WAIT, worker, [rabbit_writer]}),
     Writer.
 
 init_command_assembler(direct)  -> {ok, none};
